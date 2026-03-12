@@ -497,13 +497,14 @@ async def run_generation_task(message: Message, task_type: str, original_input: 
 
     if not has_balance(user_id, username):
         await message.answer(
-            "Бесплатные генерации закончились.\nНапиши владельцу бота для доступа к полной версии.",
+            "Похоже, бесплатные генерации закончились ✨\n\n"
+            "Если хочешь продолжить, напиши владельцу бота — поможем открыть полный доступ.",
             reply_markup=get_main_menu(user_id),
         )
         return
 
     add_history(user_id, original_input)
-    wait_msg = await message.answer("Генерирую...")
+    wait_msg = await message.answer("Секунду, собираю для тебя лучший вариант ✍️")
 
     print(f"[DEBUG] run_generation_task started | task_type={task_type} | user_id={user_id}")
 
@@ -550,23 +551,34 @@ async def run_generation_task(message: Message, task_type: str, original_input: 
             print("[WARN] wait_msg edit failed:", repr(edit_err))
             await message.answer("Готово ✅")
 
-        await message.answer(result, reply_markup=get_main_menu(user_id))
+        await message.answer(
+            "Подготовил вариант ниже 👇\n\n"
+            "Посмотри и, если захочешь, сразу улучшим его в пару нажатий.",
+            reply_markup=get_main_menu(user_id),
+        )
+        await message.answer(result)
         await message.answer(
             f"Осталось генераций: {get_balance(user_id, username)}",
             reply_markup=get_result_actions(task_type),
+        )
+        await message.answer(
+            "Главное меню снова под рукой 👌",
+            reply_markup=get_main_menu(user_id),
         )
 
     except asyncio.TimeoutError:
         print("[ERROR] OpenAI request timeout")
         await message.answer(
-            "Ошибка генерации ❌\n\nOpenAI слишком долго отвечает. Попробуй ещё раз через минуту.",
+            "Сейчас ответ собирается дольше обычного ⏳\n\n"
+            "Попробуй ещё раз через минуту — я всё подхвачу.",
             reply_markup=get_main_menu(user_id),
         )
 
     except Exception as e:
         print("[ERROR]", repr(e))
         await message.answer(
-            f"Ошибка генерации ❌\n\nТекст ошибки: {repr(e)}",
+            "Поймал техническую заминку ⚠️\n\n"
+            "Попробуй повторить запрос ещё раз чуть позже.",
             reply_markup=get_main_menu(user_id),
         )
 
@@ -582,13 +594,13 @@ async def start(message: Message):
 
     await message.answer(
         "Привет 👋\n\n"
-        "Я PosterAI — AI-редактор для Telegram-каналов.\n\n"
-        "Помогаю:\n"
-        "✍️ писать посты\n"
-        "💡 придумывать идеи\n"
-        "♻️ улучшать тексты\n"
-        "📅 делать контент-план\n\n"
-        "Выбери действие:",
+        "Я PosterAI — твой AI-редактор для Telegram-каналов.\n\n"
+        "Помогаю быстро собирать сильный контент:\n"
+        "✍️ пишу посты\n"
+        "💡 предлагаю идеи\n"
+        "♻️ улучшаю тексты\n"
+        "📅 собираю контент-план\n\n"
+        "Выбирай, с чего начнём:",
         reply_markup=get_main_menu(user_id),
     )
 
@@ -600,11 +612,12 @@ async def help_command(message: Message):
     ensure_user(user_id, username)
 
     await message.answer(
-        "Как пользоваться:\n\n"
-        "1. Выбери действие\n"
-        "2. Отправь тему или текст\n"
-        "3. Получи результат\n"
-        "4. Доработай через кнопки\n",
+        "Как здесь всё устроено 👌\n\n"
+        "1. Выбираешь нужный сценарий\n"
+        "2. Отправляешь тему или текст\n"
+        "3. Получаешь результат\n"
+        "4. При желании сразу улучшаешь его кнопками\n\n"
+        "Я могу работать и как быстрый генератор, и как аккуратный редактор под твой стиль.",
         reply_markup=get_main_menu(user_id),
     )
 
@@ -616,7 +629,7 @@ async def balance_command(message: Message):
     ensure_user(user_id, username)
 
     await message.answer(
-        f"Осталось генераций: {get_balance(user_id, username)}",
+        f"Сейчас у тебя доступно генераций: {get_balance(user_id, username)} ✨",
         reply_markup=get_main_menu(user_id),
     )
 
@@ -628,28 +641,43 @@ async def balance_command(message: Message):
 async def generate_mode(message: Message):
     user_id = message.from_user.id
     set_mode(user_id, "generate")
-    await message.answer("Напиши тему поста.", reply_markup=get_main_menu(user_id))
+    await message.answer(
+        "Отлично, давай соберём новый пост ✍️\n\n"
+        "Пришли тему, и я подготовлю черновик.",
+        reply_markup=get_main_menu(user_id),
+    )
 
 
 @dp.message(F.text == "💡 Идеи постов")
 async def ideas_mode(message: Message):
     user_id = message.from_user.id
     set_mode(user_id, "ideas")
-    await message.answer("Напиши тематику канала.", reply_markup=get_main_menu(user_id))
+    await message.answer(
+        "Супер, поищем сильные идеи 💡\n\n"
+        "Напиши тематику канала, и я предложу варианты.",
+        reply_markup=get_main_menu(user_id),
+    )
 
 
 @dp.message(F.text == "♻️ Переписать текст")
 async def rewrite_mode(message: Message):
     user_id = message.from_user.id
     set_mode(user_id, "rewrite")
-    await message.answer("Отправь текст для переписывания.", reply_markup=get_main_menu(user_id))
+    await message.answer(
+        "Присылай текст — помогу сделать его сильнее, чище и удобнее для чтения ♻️",
+        reply_markup=get_main_menu(user_id),
+    )
 
 
 @dp.message(F.text == "📅 Контент-план")
 async def plan_mode(message: Message):
     user_id = message.from_user.id
     set_mode(user_id, "content_plan")
-    await message.answer("Напиши тему канала.", reply_markup=get_main_menu(user_id))
+    await message.answer(
+        "Соберём контент-план 📅\n\n"
+        "Напиши тему канала, и я предложу структуру публикаций.",
+        reply_markup=get_main_menu(user_id),
+    )
 
 
 @dp.message(F.text == "📊 Остаток генераций")
@@ -658,7 +686,7 @@ async def balance_button(message: Message):
     username = message.from_user.username
     ensure_user(user_id, username)
     await message.answer(
-        f"Осталось генераций: {get_balance(user_id, username)}",
+        f"У тебя сейчас доступно генераций: {get_balance(user_id, username)} ✨",
         reply_markup=get_main_menu(user_id),
     )
 
@@ -671,9 +699,11 @@ async def toggle_history_handler(message: Message):
 
     enabled = toggle_history(user_id)
     text = (
-        "История включена ✅\n\nБуду учитывать последние 10 запросов."
+        "Историю включил ✅\n\n"
+        "Теперь буду учитывать последние 10 запросов, чтобы ответы были точнее и ближе к твоим задачам."
         if enabled else
-        "История выключена ✅\n\nБуду отвечать только по текущему запросу."
+        "Историю выключил ✅\n\n"
+        "Следующие ответы буду строить только от текущего запроса — без опоры на прошлый контекст."
     )
     await message.answer(text, reply_markup=get_main_menu(user_id))
 
@@ -686,8 +716,8 @@ async def connect_style(message: Message):
 
     pending_style_input.add(user_id)
     await message.answer(
-        "Пришли 3–5 примеров постов канала одним сообщением.\n"
-        "Я проанализирую стиль и буду писать в нём.",
+        "Давай зафиксируем стиль канала 🎨\n\n"
+        "Пришли 3–5 примеров постов одним сообщением, и я подстрою тон, подачу и структуру под них.",
         reply_markup=get_main_menu(user_id),
     )
 
@@ -702,13 +732,20 @@ async def toggle_style_handler(message: Message):
     if not row["style_profile"]:
         pending_style_input.add(user_id)
         await message.answer(
-            "Сначала пришли 3–5 примеров постов канала.",
+            "Сначала нужно собрать профиль стиля ✨\n\n"
+            "Пришли 3–5 примеров постов канала, и я сохраню ориентиры.",
             reply_markup=get_main_menu(user_id),
         )
         return
 
     enabled = toggle_style(user_id)
-    text = "Стиль канала включён ✅" if enabled else "Стиль канала выключен ✅"
+    text = (
+        "Стиль канала включил ✅\n\n"
+        "В следующих ответах буду ориентироваться на сохранённый tone of voice и формат."
+        if enabled else
+        "Стиль канала выключил ✅\n\n"
+        "Следующие тексты подготовлю без опоры на сохранённый стиль."
+    )
     await message.answer(text, reply_markup=get_main_menu(user_id))
 
 
@@ -718,35 +755,47 @@ async def toggle_style_handler(message: Message):
 @dp.callback_query(F.data == "result:ok")
 async def result_ok(callback: CallbackQuery):
     await callback.answer("Отлично 👌")
-    await callback.message.answer("Рад, что подошло.")
+    await callback.message.answer(
+        "Рад был помочь 🙌\n\n"
+        "Зафиксировал твои предпочтения и постараюсь учитывать их в следующих запросах.",
+        reply_markup=get_main_menu(callback.from_user.id),
+    )
 
 
 @dp.callback_query(F.data == "result:improve")
 async def result_improve(callback: CallbackQuery):
     await callback.answer()
     await callback.message.answer(
-        "Выбери, как улучшить результат:",
+        "Давай докрутим результат ✨\n\n"
+        "Выбери, как именно хочешь его улучшить:",
         reply_markup=get_improve_actions(),
     )
 
 
 @dp.callback_query(F.data.startswith("result:regen:"))
 async def result_regen(callback: CallbackQuery):
-    await callback.answer("Делаю новый вариант...")
+    await callback.answer("Собираю ещё один вариант ✍️")
     user_id = callback.from_user.id
     username = callback.from_user.username
     ensure_user(user_id, username)
 
     row = get_user_row(user_id)
     if not row["last_task_type"] or not row["last_input"]:
-        await callback.message.answer("Не нашёл предыдущий запрос.")
+        await callback.message.answer(
+            "Не нашёл предыдущий запрос, на основе которого можно собрать новый вариант.",
+            reply_markup=get_main_menu(user_id),
+        )
         return
 
     if not has_balance(user_id, username):
-        await callback.message.answer("Генерации закончились.")
+        await callback.message.answer(
+            "Похоже, генерации закончились ✨\n\n"
+            "Если хочешь продолжить, напиши владельцу бота.",
+            reply_markup=get_main_menu(user_id),
+        )
         return
 
-    await callback.message.answer("Генерирую новый вариант...")
+    await callback.message.answer("Секунду, собираю альтернативную версию...")
 
     try:
         if row["last_task_type"] == "generate":
@@ -778,24 +827,33 @@ async def result_regen(callback: CallbackQuery):
         save_last_result(user_id, row["last_task_type"], row["last_input"], result)
         decrease_balance(user_id, username)
 
-        await callback.message.answer("Новый вариант готов ✅")
-        await callback.message.answer(result, reply_markup=get_main_menu(user_id))
+        await callback.message.answer(
+            "Готово — вот ещё один вариант 👇",
+            reply_markup=get_main_menu(user_id),
+        )
+        await callback.message.answer(result)
         await callback.message.answer(
             f"Осталось генераций: {get_balance(user_id, username)}",
             reply_markup=get_result_actions(row["last_task_type"]),
+        )
+        await callback.message.answer(
+            "Главное меню снова доступно 👌",
+            reply_markup=get_main_menu(user_id),
         )
 
     except asyncio.TimeoutError:
         print("[ERROR] Regenerate timeout")
         await callback.message.answer(
-            "Ошибка генерации ❌\n\nOpenAI слишком долго отвечает. Попробуй ещё раз.",
+            "Сейчас ответ собирается дольше обычного ⏳\n\n"
+            "Попробуй ещё раз через минуту.",
             reply_markup=get_main_menu(user_id),
         )
 
     except Exception as e:
         print("[ERROR]", repr(e))
         await callback.message.answer(
-            f"Ошибка генерации ❌\n\nТекст ошибки: {repr(e)}",
+            "Поймал техническую заминку ⚠️\n\n"
+            "Попробуй повторить действие чуть позже.",
             reply_markup=get_main_menu(user_id),
         )
 
@@ -808,7 +866,7 @@ async def improve_handler(callback: CallbackQuery):
 
     row = get_user_row(user_id)
     if not row["last_generation"]:
-        await callback.answer("Нет текста для улучшения", show_alert=True)
+        await callback.answer("Сначала нужен текст для доработки", show_alert=True)
         return
 
     improve_type = callback.data.split(":")[1]
@@ -816,15 +874,19 @@ async def improve_handler(callback: CallbackQuery):
     if improve_type == "custom":
         pending_custom_improve.add(user_id)
         await callback.answer()
-        await callback.message.answer("Напиши, что нужно изменить.")
+        await callback.message.answer(
+            "Напиши, что именно хочешь изменить 📝\n\n"
+            "Чем точнее комментарий, тем лучше я подстрою результат.",
+            reply_markup=get_main_menu(user_id),
+        )
         return
 
     if not has_balance(user_id, username):
         await callback.answer("Генерации закончились", show_alert=True)
         return
 
-    await callback.answer("Улучшаю...")
-    await callback.message.answer("Улучшаю текст...")
+    await callback.answer("Докручиваю ✨")
+    await callback.message.answer("Секунду, улучшаю текст под твой запрос...")
 
     try:
         result = await asyncio.wait_for(
@@ -840,24 +902,33 @@ async def improve_handler(callback: CallbackQuery):
         save_last_result(user_id, row["last_task_type"], row["last_input"], result)
         decrease_balance(user_id, username)
 
-        await callback.message.answer("Улучшенная версия готова ✅")
-        await callback.message.answer(result, reply_markup=get_main_menu(user_id))
+        await callback.message.answer(
+            "Готово — обновил версию 👇",
+            reply_markup=get_main_menu(user_id),
+        )
+        await callback.message.answer(result)
         await callback.message.answer(
             f"Осталось генераций: {get_balance(user_id, username)}",
             reply_markup=get_result_actions(row["last_task_type"] or "generate"),
+        )
+        await callback.message.answer(
+            "Главное меню снова доступно 👌",
+            reply_markup=get_main_menu(user_id),
         )
 
     except asyncio.TimeoutError:
         print("[ERROR] Improve timeout")
         await callback.message.answer(
-            "Ошибка улучшения ❌\n\nOpenAI слишком долго отвечает. Попробуй ещё раз.",
+            "Сейчас улучшение занимает больше времени, чем обычно ⏳\n\n"
+            "Попробуй ещё раз через минуту.",
             reply_markup=get_main_menu(user_id),
         )
 
     except Exception as e:
         print("[ERROR]", repr(e))
         await callback.message.answer(
-            f"Ошибка улучшения ❌\n\nТекст ошибки: {repr(e)}",
+            "Поймал техническую заминку ⚠️\n\n"
+            "Попробуй ещё раз чуть позже.",
             reply_markup=get_main_menu(user_id),
         )
 
@@ -877,14 +948,22 @@ async def text_handler(message: Message):
 
         row = get_user_row(user_id)
         if not row["last_generation"]:
-            await message.answer("Не нашёл предыдущий текст.", reply_markup=get_main_menu(user_id))
+            await message.answer(
+                "Не нашёл предыдущий текст для доработки.\n\n"
+                "Давай сначала сгенерируем или улучшим материал.",
+                reply_markup=get_main_menu(user_id),
+            )
             return
 
         if not has_balance(user_id, username):
-            await message.answer("Генерации закончились.", reply_markup=get_main_menu(user_id))
+            await message.answer(
+                "Похоже, генерации закончились ✨\n\n"
+                "Если хочешь продолжить, напиши владельцу бота.",
+                reply_markup=get_main_menu(user_id),
+            )
             return
 
-        await message.answer("Применяю комментарий...")
+        await message.answer("Принял комментарий, адаптирую текст под него ✍️")
 
         try:
             result = await asyncio.wait_for(
@@ -900,18 +979,26 @@ async def text_handler(message: Message):
             save_last_result(user_id, row["last_task_type"], row["last_input"], result)
             decrease_balance(user_id, username)
 
-            await message.answer("Готово ✅")
-            await message.answer(result, reply_markup=get_main_menu(user_id))
+            await message.answer(
+                "Готово — учёл твой комментарий 👇",
+                reply_markup=get_main_menu(user_id),
+            )
+            await message.answer(result)
             await message.answer(
                 f"Осталось генераций: {get_balance(user_id, username)}",
                 reply_markup=get_result_actions(row["last_task_type"] or "generate"),
+            )
+            await message.answer(
+                "Главное меню снова под рукой 👌",
+                reply_markup=get_main_menu(user_id),
             )
             return
 
         except asyncio.TimeoutError:
             print("[ERROR] Custom improve timeout")
             await message.answer(
-                "Ошибка улучшения ❌\n\nOpenAI слишком долго отвечает. Попробуй ещё раз.",
+                "Сейчас ответ собирается дольше обычного ⏳\n\n"
+                "Попробуй ещё раз через минуту.",
                 reply_markup=get_main_menu(user_id),
             )
             return
@@ -919,13 +1006,14 @@ async def text_handler(message: Message):
         except Exception as e:
             print("[ERROR]", repr(e))
             await message.answer(
-                f"Ошибка улучшения ❌\n\nТекст ошибки: {repr(e)}",
+                "Поймал техническую заминку ⚠️\n\n"
+                "Попробуй повторить действие чуть позже.",
                 reply_markup=get_main_menu(user_id),
             )
             return
 
     if user_id in pending_style_input:
-        await message.answer("Анализирую стиль...")
+        await message.answer("Смотрю примеры и собираю профиль стиля 🎨")
 
         try:
             profile = await asyncio.wait_for(
@@ -935,9 +1023,14 @@ async def text_handler(message: Message):
             save_style_profile(user_id, profile)
             pending_style_input.discard(user_id)
 
-            await message.answer("Стиль сохранён ✅")
             await message.answer(
-                f"Профиль стиля:\n\n{profile}",
+                "Готово — стиль зафиксировал ✅\n\n"
+                "Теперь смогу лучше подстраивать подачу под твой канал.",
+                reply_markup=get_main_menu(user_id),
+            )
+            await message.answer(f"Профиль стиля:\n\n{profile}")
+            await message.answer(
+                "Главное меню снова доступно 👌",
                 reply_markup=get_main_menu(user_id),
             )
             return
@@ -945,7 +1038,8 @@ async def text_handler(message: Message):
         except asyncio.TimeoutError:
             print("[ERROR] Style analyze timeout")
             await message.answer(
-                "Ошибка анализа стиля ❌\n\nOpenAI слишком долго отвечает. Попробуй ещё раз.",
+                "Сейчас анализ стиля занимает больше времени, чем обычно ⏳\n\n"
+                "Попробуй отправить примеры ещё раз через минуту.",
                 reply_markup=get_main_menu(user_id),
             )
             return
@@ -953,7 +1047,8 @@ async def text_handler(message: Message):
         except Exception as e:
             print("[ERROR]", repr(e))
             await message.answer(
-                f"Ошибка анализа стиля ❌\n\nТекст ошибки: {repr(e)}",
+                "Не получилось обработать примеры стиля ⚠️\n\n"
+                "Попробуй ещё раз чуть позже.",
                 reply_markup=get_main_menu(user_id),
             )
             return
