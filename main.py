@@ -855,7 +855,7 @@ def format_tariff(user: dict) -> str:
 
 def build_system_prompt(category: str, user_id: int) -> str:
     user = get_user_row(user_id)
-    memory_enabled = bool(user["memory_enabled"])
+    memory_enabled = bool(user.get("memory_enabled", False))
     style_samples = get_style_samples(user_id)
     preferences = get_preferences(user_id, category)
 
