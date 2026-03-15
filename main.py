@@ -1998,5 +1998,17 @@ if __name__ == "__main__":
         logger.info("Bot stopped")
 
 # =========================
-# END
+# FALLBACK
 # =========================
+
+@dp.message()
+async def fallback_handler(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    await state.clear()
+
+    await message.answer(
+        "Я готов помочь 👌\n\n"
+        "Выберите режим в меню:",
+        reply_markup=main_menu_keyboard(),
+    )
