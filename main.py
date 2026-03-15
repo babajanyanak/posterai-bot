@@ -988,34 +988,23 @@ def get_prompt_request_text(category: str) -> str:
 # =========================
 
 def call_openai_text(system_prompt: str, user_prompt: str) -> str:
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=OPENAI_MODEL,
-        input=[
+        messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        temperature=0.7,
     )
 
-    text_output = getattr(response, "output_text", None)
-    if text_output:
-        return text_output.strip()
+    if not response.choices:
+        raise RuntimeError("OpenAI не вернул choices")
 
-    # fallback на случай другой структуры SDK
-    try:
-        parts = []
-        for item in response.output:
-            content = getattr(item, "content", None) or []
-            for c in content:
-                txt = getattr(c, "text", None)
-                if txt:
-                    parts.append(txt)
-        final_text = "\n".join(parts).strip()
-        if final_text:
-            return final_text
-    except Exception:
-        pass
+    message = response.choices[0].message
+    if not message or not message.content:
+        raise RuntimeError("OpenAI не вернул текстовый ответ")
 
-    raise RuntimeError("OpenAI не вернул текстовый ответ")
+    return message.content.strip()
 
 def build_generation_payload(user_id: int, category: str, user_prompt: str) -> tuple[str, str]:
     user = get_user(user_id)
