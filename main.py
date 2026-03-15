@@ -228,6 +228,9 @@ def init_db():
             cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS status TEXT")
             cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_id TEXT")
             cur.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+            # drop NOT NULL on legacy columns that our code doesn't populate
+            cur.execute("ALTER TABLE payments ALTER COLUMN product_code DROP NOT NULL")
+            cur.execute("ALTER TABLE payments ALTER COLUMN idempotence_key DROP NOT NULL")
             cur.execute("ALTER TABLE generation_sessions ADD COLUMN IF NOT EXISTS category TEXT")
             cur.execute("ALTER TABLE generation_sessions ADD COLUMN IF NOT EXISTS original_prompt TEXT")
             cur.execute("ALTER TABLE generation_sessions ADD COLUMN IF NOT EXISTS generated_text TEXT")
