@@ -698,16 +698,15 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [
                 KeyboardButton(text="✍️ Сгенерировать пост"),
-                KeyboardButton(text="💡 Идеи постов"),
+                KeyboardButton(text="💡 Идеи для постов"),
             ],
-            [KeyboardButton(text="♻️ Переписать текст")],
             [
-                KeyboardButton(text="👤 Мой тариф"),
+                KeyboardButton(text="🔁 Переписать текст"),
+                KeyboardButton(text="⚙️ Настроить бота"),
+            ],
+            [
                 KeyboardButton(text="📊 Остаток генераций"),
-            ],
-            [
                 KeyboardButton(text="💳 Тарифы"),
-                KeyboardButton(text="🕘 Настройка бота"),
             ],
         ],
         resize_keyboard=True,
@@ -810,7 +809,6 @@ def get_my_tariff_text(user: dict, telegram_username: Optional[str] = None) -> s
     lines.append("Рад был помочь! Сохраняем ваши предпочтения — в следующих генерациях учтём 😉")
     return "\n".join(lines)
 
-# FIX: added telegram_username parameter
 def get_tariffs_text(user: dict, telegram_username: Optional[str] = None) -> str:
     lines = [
         "💳 Тарифы PosteraAI",
@@ -839,7 +837,7 @@ def get_settings_text(user: dict) -> str:
     style_count = len(style_samples)
 
     return (
-        "🕘 Настройка бота\n\n"
+        "⚙️ Настройка бота\n\n"
         f"🧠 Память: {memory_enabled}\n"
         f"✍️ Примеров стиля сохранено: {style_count}\n\n"
         "Здесь можно добавить примеры своих текстов, очистить стиль или управлять памятью."
@@ -860,7 +858,7 @@ def get_prompt_request_text(category: str) -> str:
         )
     if category == CATEGORY_REWRITE:
         return (
-            "♻️ Пришлите текст, который нужно переписать.\n\n"
+            "🔁 Пришлите текст, который нужно переписать.\n\n"
             "Я сделаю его чище, сильнее и удобнее для чтения."
         )
     return "Отправьте текст."
@@ -1119,9 +1117,28 @@ async def cmd_start(message: Message, state: FSMContext):
     track_event(user_id, "main_menu_opened")
     await state.clear()
     text = (
-        "Привет! Я PosteraAI 👋\n\n"
-        "Помогу быстро подготовить пост, придумать идеи или переписать текст под нужную задачу.\n\n"
-        "Выберите, с чем помочь 👇"
+        "👋 Привет! Я PosteraAI\n\n"
+        "AI-ассистент для контент-менеджеров, авторов и предпринимателей, "
+        "который помогает создавать сильные тексты быстрее.\n\n"
+        "Подхожу для работы с:\n"
+        "• Telegram\n"
+        "• соцсетями\n"
+        "• рассылками\n"
+        "• лендингами\n"
+        "• любым регулярным контентом\n\n"
+        "Что я умею\n"
+        "✍️ Генерировать посты по теме\n"
+        "✂️ Сокращать текст без потери смысла\n"
+        "💰 Усиливать продающий смысл\n"
+        "🎯 Переписывать текст под нужный стиль\n"
+        "🧠 Помогать структурировать идеи для контента\n\n"
+        "Я подстраиваюсь под ваш стиль\n\n"
+        "Вы можете:\n"
+        "• настроить формат ответов\n"
+        "• задать tone of voice\n"
+        "• прислать примеры своих текстов\n"
+        "Я проанализирую их и буду генерировать тексты в вашем стиле.\n\n"
+        "👇 Выберите действие в меню ниже"
     )
     await message.answer(text, reply_markup=main_menu_keyboard())
 
@@ -1196,30 +1213,19 @@ async def menu_generate_post(message: Message, state: FSMContext):
     track_event(message.from_user.id, "category_selected", category=CATEGORY_POST)
     await message.answer(get_prompt_request_text(CATEGORY_POST), reply_markup=main_menu_keyboard())
 
-@dp.message(F.text == "💡 Идеи постов")
+@dp.message(F.text == "💡 Идеи для постов")
 async def menu_post_ideas(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(GenerationStates.waiting_for_ideas_prompt)
     track_event(message.from_user.id, "category_selected", category=CATEGORY_IDEAS)
     await message.answer(get_prompt_request_text(CATEGORY_IDEAS), reply_markup=main_menu_keyboard())
 
-@dp.message(F.text == "♻️ Переписать текст")
+@dp.message(F.text == "🔁 Переписать текст")
 async def menu_rewrite_text(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(GenerationStates.waiting_for_rewrite_prompt)
     track_event(message.from_user.id, "category_selected", category=CATEGORY_REWRITE)
     await message.answer(get_prompt_request_text(CATEGORY_REWRITE), reply_markup=main_menu_keyboard())
-
-@dp.message(F.text == "👤 Мой тариф")
-async def menu_my_tariff(message: Message):
-    user_id = message.from_user.id
-    refresh_expired_plan_if_needed(user_id)
-    user = get_user(user_id)
-    track_event(user_id, "my_tariff_opened")
-    await message.answer(
-        get_my_tariff_text(user, telegram_username=message.from_user.username),
-        reply_markup=main_menu_keyboard(),
-    )
 
 @dp.message(F.text == "📊 Остаток генераций")
 async def menu_balance(message: Message):
@@ -1228,7 +1234,6 @@ async def menu_balance(message: Message):
     user = get_user(user_id)
     await message.answer(get_generations_left_text(user), reply_markup=main_menu_keyboard())
 
-# FIX: moved above fallback handler so it gets registered first
 @dp.message(F.text == "💳 Тарифы")
 async def menu_tariffs(message: Message):
     user_id = message.from_user.id
@@ -1238,7 +1243,7 @@ async def menu_tariffs(message: Message):
         reply_markup=tariffs_inline_keyboard_for_user(message.from_user.username),
     )
 
-@dp.message(F.text == "🕘 Настройка бота")
+@dp.message(F.text == "⚙️ Настроить бота")
 async def menu_settings(message: Message, state: FSMContext):
     user = get_user(message.from_user.id)
     await state.clear()
@@ -1322,7 +1327,7 @@ async def handle_ideas_prompt(message: Message, state: FSMContext):
 async def handle_rewrite_prompt(message: Message, state: FSMContext):
     user_prompt = (message.text or "").strip()
     if not user_prompt:
-        await message.answer("Пришлите текст, который нужно переписать ♻️")
+        await message.answer("Пришлите текст, который нужно переписать 🔁")
         return
     await state.clear()
     await start_generation_flow(message, CATEGORY_REWRITE, user_prompt)
@@ -1492,8 +1497,8 @@ async def fallback_handler(message: Message, state: FSMContext):
         "Я готов помочь 👌\n\n"
         "Выберите режим в меню:\n"
         "✍️ Сгенерировать пост\n"
-        "💡 Идеи постов\n"
-        "♻️ Переписать текст",
+        "💡 Идеи для постов\n"
+        "🔁 Переписать текст",
         reply_markup=main_menu_keyboard(),
     )
 
