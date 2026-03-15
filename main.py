@@ -62,6 +62,7 @@ FREE_GENERATIONS_DEFAULT = 10
 CREATOR_GENERATIONS_DEFAULT = 200
 
 FREE_REFINEMENTS_COUNT = 2
+HISTORY_LIMIT_PER_CATEGORY = 20
 
 YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 
@@ -96,8 +97,9 @@ class GenerationStates(StatesGroup):
     waiting_for_post_prompt = State()
     waiting_for_ideas_prompt = State()
     waiting_for_rewrite_prompt = State()
-    waiting_for_refinement_prompt = State()
-    waiting_for_style_sample = State()
+    # Two-step refinements requiring extra user input
+    waiting_for_audience_input = State()
+    waiting_for_custom_refinement = State()
 
 class SettingsStates(StatesGroup):
     waiting_for_style_sample = State()
@@ -441,7 +443,11 @@ def save_history(user_id: int, category: str, role: str, text: str, is_final: bo
             )
         conn.commit()
 
-def get_last_history_items(user_id: int, category: Optional[str] = None, limit: int = 10) -> list[dict]:
+def get_last_history_items(
+    user_id: int,
+    category: Optional[str] = None,
+    limit: int = HISTORY_LIMIT_PER_CATEGORY,
+) -> list[dict]:
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             if category:
@@ -464,6 +470,24 @@ def get_last_history_items(user_id: int, category: Optional[str] = None, limit: 
                 )
             rows = cur.fetchall() or []
             return [dict(r) for r in rows]
+
+def clear_history(user_id: int, category: Optional[str] = None):
+    """Delete history rows and category memory for this user."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            if category:
+                cur.execute(
+                    "DELETE FROM user_history WHERE telegram_id = %s AND category = %s",
+                    (user_id, category),
+                )
+                cur.execute(
+                    "DELETE FROM user_category_memory WHERE telegram_id = %s AND category = %s",
+                    (user_id, category),
+                )
+            else:
+                cur.execute("DELETE FROM user_history WHERE telegram_id = %s", (user_id,))
+                cur.execute("DELETE FROM user_category_memory WHERE telegram_id = %s", (user_id,))
+        conn.commit()
 
 def save_category_memory(user_id: int, category: str, prompt: str):
     with get_db_connection() as conn:
@@ -637,8 +661,9 @@ def get_system_prompt(category: str) -> str:
     if category == CATEGORY_IDEAS:
         return (
             base
-            + " Сгенерируй идеи постов на русском языке. "
-              "Идеи должны быть конкретными, небанальными и пригодными для Telegram."
+            + " Сгенерируй список идей постов на русском языке. "
+              "Идеи должны быть конкретными, небанальными и пригодными для Telegram. "
+              "Пронумеруй их."
         )
     if category == CATEGORY_REWRITE:
         return (
@@ -678,13 +703,59 @@ def build_user_prompt(
 
     return "\n\n".join(parts)
 
-def build_refinement_prompt(refinement_type: str, current_text: str) -> str:
+def build_refinement_prompt(refinement_type: str, current_text: str, extra: str = "") -> str:
+    """
+    refinement_type values:
+      shorter, selling, lively, cta, telegram,
+      audience  (extra = audience description),
+      deeper, bolder      — ideas only
+      cleaner, structure  — rewrite only
+      custom    (extra = user instruction)
+    """
     mapping = {
-        "shorter": "Сократи текст без потери смысла. Убери лишнее, сделай компактнее и чище.",
-        "telegram": "Адаптируй текст под Telegram: сделай живее, разговорнее, удобнее для чтения с телефона.",
-        "selling": "Сделай текст более продающим: усили оффер, ценность, призыв к действию.",
-        "structure": "Добавь больше структуры: сильные абзацы, списки при необходимости, ясные акценты.",
-        "style": "Улучши стиль текста: сделай формулировки сильнее, чище и выразительнее.",
+        "shorter": (
+            "Сократи текст без потери смысла. "
+            "Убери лишнее, сделай компактнее и чище."
+        ),
+        "selling": (
+            "Сделай текст более продающим: "
+            "усили оффер, ценность и мотивацию читателя."
+        ),
+        "lively": (
+            "Сделай текст живее: легче, естественнее и эмоциональнее. "
+            "Убери сухость и канцелярит."
+        ),
+        "cta": (
+            "Добавь в текст чёткий призыв к действию (CTA). "
+            "Например: подпишись, напиши, попробуй, перейди — выбери подходящий по контексту."
+        ),
+        "telegram": (
+            "Адаптируй текст под формат Telegram: "
+            "короткие абзацы, удобный ритм, разговорный стиль, высокая читаемость с телефона."
+        ),
+        "audience": (
+            f"Адаптируй текст для следующей аудитории: {extra}. "
+            "Учти их язык, боли и интересы."
+        ),
+        "deeper": (
+            "Сделай идеи менее банальными и более содержательными. "
+            "Добавь экспертную глубину и нестандартные углы."
+        ),
+        "bolder": (
+            "Сделай идеи провокационнее, ярче и цепляющими. "
+            "Не бойся смелых формулировок."
+        ),
+        "cleaner": (
+            "Сделай текст чище: убери канцелярит, упрости язык, "
+            "сделай его легче для восприятия."
+        ),
+        "structure": (
+            "Улучши структуру текста: добавь логические блоки, "
+            "улучши последовательность, сделай текст более читабельным."
+        ),
+        "custom": (
+            f"Применяй следующую правку к тексту: {extra}"
+        ),
     }
     instruction = mapping.get(refinement_type, "Улучши текст.")
     return f"{instruction}\n\nТекущий текст:\n{current_text}"
@@ -714,13 +785,14 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 def settings_keyboard(user: dict) -> ReplyKeyboardMarkup:
     memory_enabled = bool(user.get("memory_enabled", True))
-    memory_button = "🧠 Память: вкл" if memory_enabled else "🧠 Память: выкл"
+    memory_button = "✅ Память включена" if memory_enabled else "⛔ Память выключена"
 
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Добавить пример текста")],
-            [KeyboardButton(text="🗑 Очистить стиль")],
             [KeyboardButton(text=memory_button)],
+            [KeyboardButton(text="♻️ Сбросить память")],
+            [KeyboardButton(text="✍️ Копировать стиль")],
+            [KeyboardButton(text="🗑 Очистить стиль")],
             [KeyboardButton(text="⬅️ Назад в меню")],
         ],
         resize_keyboard=True,
@@ -752,7 +824,7 @@ def result_inline_keyboard(session_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✏️ Доработать", callback_data=f"refine:{session_id}"),
-                InlineKeyboardButton(text="🔁 Перегенерировать", callback_data=f"regen:{session_id}"),
+                InlineKeyboardButton(text="🔁 Другой вариант", callback_data=f"regen:{session_id}"),
             ],
             [
                 InlineKeyboardButton(text="📋 Скопировать", callback_data=f"copy:{session_id}"),
@@ -761,17 +833,42 @@ def result_inline_keyboard(session_id: int) -> InlineKeyboardMarkup:
         ]
     )
 
-def refinement_inline_keyboard(session_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✂️ Короче", callback_data=f"refine_type:{session_id}:shorter")],
-            [InlineKeyboardButton(text="📱 Под Telegram", callback_data=f"refine_type:{session_id}:telegram")],
-            [InlineKeyboardButton(text="💰 Продающим", callback_data=f"refine_type:{session_id}:selling")],
-            [InlineKeyboardButton(text="🎯 Добавить структуру", callback_data=f"refine_type:{session_id}:structure")],
-            [InlineKeyboardButton(text="✨ Улучшить стиль", callback_data=f"refine_type:{session_id}:style")],
-            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu")],
-        ]
-    )
+def refinement_inline_keyboard(session_id: int, category: str) -> InlineKeyboardMarkup:
+    """Return category-specific refinement keyboard."""
+    rows = [
+        [
+            InlineKeyboardButton(text="✂️ Короче", callback_data=f"refine_type:{session_id}:shorter"),
+            InlineKeyboardButton(text="💰 Продающим", callback_data=f"refine_type:{session_id}:selling"),
+        ],
+        [
+            InlineKeyboardButton(text="✨ Живее", callback_data=f"refine_type:{session_id}:lively"),
+            InlineKeyboardButton(text="📣 С CTA", callback_data=f"refine_type:{session_id}:cta"),
+        ],
+        [
+            InlineKeyboardButton(text="📱 Под Telegram", callback_data=f"refine_type:{session_id}:telegram"),
+            InlineKeyboardButton(text="🎯 Для конкретной ЦА", callback_data=f"refine_type:{session_id}:audience"),
+        ],
+    ]
+
+    if category == CATEGORY_IDEAS:
+        rows.append([
+            InlineKeyboardButton(text="🧠 Глубже", callback_data=f"refine_type:{session_id}:deeper"),
+            InlineKeyboardButton(text="⚡ Смелее", callback_data=f"refine_type:{session_id}:bolder"),
+        ])
+    elif category == CATEGORY_REWRITE:
+        rows.append([
+            InlineKeyboardButton(text="🧼 Чище", callback_data=f"refine_type:{session_id}:cleaner"),
+            InlineKeyboardButton(text="🧱 Структурнее", callback_data=f"refine_type:{session_id}:structure"),
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="✏️ Своя правка", callback_data=f"refine_type:{session_id}:custom"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_menu"),
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # =========================
 # UI TEXT HELPERS
@@ -840,28 +937,72 @@ def get_settings_text(user: dict) -> str:
         "⚙️ Настройка бота\n\n"
         f"🧠 Память: {memory_enabled}\n"
         f"✍️ Примеров стиля сохранено: {style_count}\n\n"
-        "Здесь можно добавить примеры своих текстов, очистить стиль или управлять памятью."
+        "Здесь можно управлять памятью, добавить примеры своих текстов или очистить стиль."
     )
 
 def get_prompt_request_text(category: str) -> str:
     if category == CATEGORY_POST:
         return (
-            "✍️ Отправьте тему, тезисы или короткое описание — и я соберу готовый пост.\n\n"
-            "Например:\n"
-            "«Сделай пост о том, почему CRM в девелопменте — это не просто база клиентов»"
+            "✍️ Напиши тему поста или короткий бриф.\n\n"
+            "Можно указать:\n"
+            "• тему\n"
+            "• продукт\n"
+            "• цель поста\n"
+            "• аудиторию"
         )
     if category == CATEGORY_IDEAS:
         return (
-            "💡 Отправьте тему, нишу или продукт — и я предложу идеи постов.\n\n"
-            "Например:\n"
-            "«Идеи постов для Telegram-канала про недвижимость бизнес-класса»"
+            "💡 Напиши тему, нишу или продукт.\n\n"
+            "Я предложу идеи постов для канала."
         )
     if category == CATEGORY_REWRITE:
-        return (
-            "🔁 Пришлите текст, который нужно переписать.\n\n"
-            "Я сделаю его чище, сильнее и удобнее для чтения."
-        )
+        return "🔁 Отправь текст, который нужно переписать или улучшить."
     return "Отправьте текст."
+
+def get_refinement_menu_text(session: dict) -> str:
+    refinement_count = int(session.get("refinement_count", 0))
+    free_left = max(FREE_REFINEMENTS_COUNT - refinement_count, 0)
+    category = session.get("category", "")
+
+    if category == CATEGORY_POST:
+        options = (
+            "✂️ Короче — сокращает без потери смысла\n"
+            "💰 Продающим — усиливает оффер и мотивацию\n"
+            "✨ Живее — легче, естественнее, эмоциональнее\n"
+            "📣 С CTA — добавляет призыв к действию\n"
+            "📱 Под Telegram — адаптирует под формат\n"
+            "🎯 Для конкретной ЦА — уточнит аудиторию\n"
+            "✏️ Своя правка — напиши свою инструкцию"
+        )
+    elif category == CATEGORY_IDEAS:
+        options = (
+            "✂️ Короче — сокращает без потери смысла\n"
+            "💰 Продающим — усиливает оффер и мотивацию\n"
+            "✨ Живее — легче, естественнее, эмоциональнее\n"
+            "📣 С CTA — добавляет призыв к действию\n"
+            "📱 Под Telegram — адаптирует под формат\n"
+            "🎯 Для конкретной ЦА — уточнит аудиторию\n"
+            "🧠 Глубже — менее банально, экспертнее\n"
+            "⚡ Смелее — провокационнее и ярче\n"
+            "✏️ Своя правка — напиши свою инструкцию"
+        )
+    else:
+        options = (
+            "✂️ Короче — сокращает без потери смысла\n"
+            "💰 Продающим — усиливает оффер и мотивацию\n"
+            "✨ Живее — легче, естественнее, эмоциональнее\n"
+            "📣 С CTA — добавляет призыв к действию\n"
+            "📱 Под Telegram — адаптирует под формат\n"
+            "🎯 Для конкретной ЦА — уточнит аудиторию\n"
+            "🧼 Чище — убирает канцелярит\n"
+            "🧱 Структурнее — улучшает логику и блоки\n"
+            "✏️ Своя правка — напиши свою инструкцию"
+        )
+
+    text = f"✏️ Выберите, как доработать результат:\n\n{options}"
+    if free_left > 0:
+        text += f"\n\n🎁 Бесплатных доработок осталось: {free_left}"
+    return text
 
 # =========================
 # COMMON SENDERS
@@ -954,8 +1095,17 @@ async def start_generation_flow(message: Message, category: str, user_prompt: st
 
         track_event(user_id, "generation_success", category=category, meta={"response_length": len(result_text)})
 
+        label = (
+            "Вот вариант поста:" if category == CATEGORY_POST
+            else "Вот идеи постов:" if category == CATEGORY_IDEAS
+            else "Вот переработанный текст:"
+        )
+
         await wait_msg.delete()
-        await message.answer(f"✅ Готово!\n\n{result_text}", reply_markup=result_inline_keyboard(session_id))
+        await message.answer(
+            f"{label}\n\n{result_text}",
+            reply_markup=result_inline_keyboard(session_id),
+        )
         await message.answer(
             "Рад был помочь! Сохраняем ваши предпочтения — в следующих генерациях учтём 😉",
             reply_markup=main_menu_keyboard(),
@@ -994,7 +1144,7 @@ async def regenerate_from_session(callback: CallbackQuery, session_id: int):
         value="regenerate", meta={"prompt_length": len(session["original_prompt"] or "")},
     )
 
-    await callback.answer("Перегенерирую ✨")
+    await callback.answer("Делаю другой вариант ✨")
     wait_msg = await callback.message.answer("⏳ Делаю новый вариант...")
 
     try:
@@ -1006,16 +1156,23 @@ async def regenerate_from_session(callback: CallbackQuery, session_id: int):
                     meta={"response_length": len(result_text)})
 
         await wait_msg.delete()
-        await callback.message.answer(f"🔁 Новый вариант готов:\n\n{result_text}",
-                                      reply_markup=result_inline_keyboard(session_id))
-        await callback.message.answer("Если нужно, можем ещё докрутить текст 😉", reply_markup=main_menu_keyboard())
+        await callback.message.answer(
+            f"🔁 Другой вариант готов:\n\n{result_text}",
+            reply_markup=result_inline_keyboard(session_id),
+        )
+        await callback.message.answer(
+            "Если нужно, можем ещё докрутить текст 😉",
+            reply_markup=main_menu_keyboard(),
+        )
     except Exception as e:
         logger.exception("Regeneration failed: %s", e)
         track_event(user_id, "generation_failed", category=session["category"], value="regenerate",
                     meta={"error": str(e)[:500]})
         await wait_msg.delete()
-        await callback.message.answer("Кажется произошла ошибка 😅 Попробуем ещё раз?",
-                                      reply_markup=main_menu_keyboard())
+        await callback.message.answer(
+            "Кажется произошла ошибка 😅 Попробуем ещё раз?",
+            reply_markup=main_menu_keyboard(),
+        )
 
 def refinement_requires_generation(user_id: int, session: dict) -> bool:
     refinement_count = int(session.get("refinement_count", 0))
@@ -1026,7 +1183,12 @@ def refinement_requires_generation(user_id: int, session: dict) -> bool:
         return False
     return True
 
-async def apply_refinement(callback: CallbackQuery, session_id: int, refinement_type: str):
+async def apply_refinement(
+    callback: CallbackQuery,
+    session_id: int,
+    refinement_type: str,
+    extra: str = "",
+):
     session = get_generation_session(session_id)
     if not session:
         await callback.answer("Сессия не найдена", show_alert=True)
@@ -1076,7 +1238,7 @@ async def apply_refinement(callback: CallbackQuery, session_id: int, refinement_
             "Сохраняй смысл, усиливай подачу, не уходи в канцелярит. "
             "Отвечай только готовым финальным текстом на русском языке."
         )
-        user_prompt = build_refinement_prompt(refinement_type, current_text)
+        user_prompt = build_refinement_prompt(refinement_type, current_text, extra=extra)
         result_text = await asyncio.to_thread(call_openai_text, system_prompt, user_prompt)
 
         update_generation_session_text(session_id, result_text, increment_refinement=True)
@@ -1086,24 +1248,107 @@ async def apply_refinement(callback: CallbackQuery, session_id: int, refinement_
                     value=f"refinement:{refinement_type}", meta={"response_length": len(result_text)})
 
         await wait_msg.delete()
-        await callback.message.answer(f"✨ Обновил результат:\n\n{result_text}",
-                                      reply_markup=result_inline_keyboard(session_id))
+        await callback.message.answer(
+            f"✨ Обновил результат:\n\n{result_text}",
+            reply_markup=result_inline_keyboard(session_id),
+        )
 
         refinement_count_after = int(session.get("refinement_count", 0)) + 1
         if refinement_count_after < FREE_REFINEMENTS_COUNT:
             free_left = FREE_REFINEMENTS_COUNT - refinement_count_after
-            await callback.message.answer(f"🎁 Бесплатных доработок осталось: {free_left}",
-                                          reply_markup=main_menu_keyboard())
+            await callback.message.answer(
+                f"🎁 Бесплатных доработок осталось: {free_left}",
+                reply_markup=main_menu_keyboard(),
+            )
         else:
-            await callback.message.answer("Готово! Если захотите, можем ещё подкрутить результат 😉",
-                                          reply_markup=main_menu_keyboard())
+            await callback.message.answer(
+                "Готово! Если захотите, можем ещё подкрутить результат 😉",
+                reply_markup=main_menu_keyboard(),
+            )
     except Exception as e:
         logger.exception("Refinement failed: %s", e)
         track_event(user_id, "generation_failed", category=session["category"],
                     value=f"refinement:{refinement_type}", meta={"error": str(e)[:500]})
         await wait_msg.delete()
-        await callback.message.answer("Кажется произошла ошибка 😅 Попробуем ещё раз?",
-                                      reply_markup=main_menu_keyboard())
+        await callback.message.answer(
+            "Кажется произошла ошибка 😅 Попробуем ещё раз?",
+            reply_markup=main_menu_keyboard(),
+        )
+
+async def _apply_refinement_from_message(
+    message: Message,
+    session_id: int,
+    refinement_type: str,
+    extra: str = "",
+):
+    """Apply a refinement initiated via a plain text message (after two-step input)."""
+    session = get_generation_session(session_id)
+    if not session:
+        await message.answer("Сессия не найдена.", reply_markup=main_menu_keyboard())
+        return
+
+    user_id = message.from_user.id
+    current_text = session.get("generated_text", "")
+
+    if not current_text.strip():
+        await message.answer("Нет текста для доработки.", reply_markup=main_menu_keyboard())
+        return
+
+    need_generation = refinement_requires_generation(user_id, session)
+    if need_generation:
+        refresh_expired_plan_if_needed(user_id)
+        user = get_user(user_id)
+
+        if not can_spend_generation(user) or not spend_generation(user_id, 1):
+            track_event(user_id, "limit_reached", category=session["category"], value="refinement")
+            await message.answer(
+                "Бесплатные доработки уже закончились, а лимит генераций тоже на нуле 😅\n\nВыберите тариф, и продолжим 👇",
+                reply_markup=tariffs_inline_keyboard(),
+            )
+            return
+
+    track_event(user_id, "generation_started", category=session["category"],
+                value=f"refinement:{refinement_type}",
+                meta={"session_id": session_id, "current_length": len(current_text)})
+
+    wait_msg = await message.answer("⏳ Дорабатываю результат...")
+
+    try:
+        system_prompt = (
+            "Ты сильный русскоязычный редактор. "
+            "Сохраняй смысл, усиливай подачу, не уходи в канцелярит. "
+            "Отвечай только готовым финальным текстом на русском языке."
+        )
+        user_prompt = build_refinement_prompt(refinement_type, current_text, extra=extra)
+        result_text = await asyncio.to_thread(call_openai_text, system_prompt, user_prompt)
+
+        update_generation_session_text(session_id, result_text, increment_refinement=True)
+        save_history(user_id, session["category"], "assistant", result_text, is_final=True)
+
+        track_event(user_id, "generation_success", category=session["category"],
+                    value=f"refinement:{refinement_type}", meta={"response_length": len(result_text)})
+
+        await wait_msg.delete()
+        await message.answer(
+            f"✨ Обновил результат:\n\n{result_text}",
+            reply_markup=result_inline_keyboard(session_id),
+        )
+
+        refinement_count_after = int(session.get("refinement_count", 0)) + 1
+        if refinement_count_after < FREE_REFINEMENTS_COUNT:
+            free_left = FREE_REFINEMENTS_COUNT - refinement_count_after
+            await message.answer(f"🎁 Бесплатных доработок осталось: {free_left}", reply_markup=main_menu_keyboard())
+        else:
+            await message.answer(
+                "Готово! Если захотите, можем ещё подкрутить результат 😉",
+                reply_markup=main_menu_keyboard(),
+            )
+    except Exception as e:
+        logger.exception("Refinement (from message) failed: %s", e)
+        track_event(user_id, "generation_failed", category=session["category"],
+                    value=f"refinement:{refinement_type}", meta={"error": str(e)[:500]})
+        await wait_msg.delete()
+        await message.answer("Кажется произошла ошибка 😅 Попробуем ещё раз?", reply_markup=main_menu_keyboard())
 
 # =========================
 # COMMANDS / COMMON HANDLERS
@@ -1255,27 +1500,10 @@ async def back_to_menu_message(message: Message, state: FSMContext):
     await send_main_menu(message, "Главное меню снова перед вами 👇")
 
 # =========================
-# SETTINGS
+# SETTINGS HANDLERS
 # =========================
 
-@dp.message(F.text == "➕ Добавить пример текста")
-async def add_style_sample_start(message: Message, state: FSMContext):
-    await state.set_state(SettingsStates.waiting_for_style_sample)
-    await message.answer(
-        "Пришлите один или несколько примеров вашего текста.\n\n"
-        "Я сохраню подачу и буду учитывать её в следующих генерациях ✍️",
-        reply_markup=settings_keyboard(get_user(message.from_user.id)),
-    )
-
-@dp.message(F.text == "🗑 Очистить стиль")
-async def clear_style(message: Message):
-    clear_style_samples(message.from_user.id)
-    await message.answer(
-        "✅ Примеры стиля очищены.\nТеперь буду опираться только на новые вводные.",
-        reply_markup=settings_keyboard(get_user(message.from_user.id)),
-    )
-
-@dp.message(F.text.in_(["🧠 Память: вкл", "🧠 Память: выкл"]))
+@dp.message(F.text.in_(["✅ Память включена", "⛔ Память выключена"]))
 async def toggle_memory(message: Message):
     user = get_user(message.from_user.id)
     new_value = not bool(user.get("memory_enabled", True))
@@ -1287,6 +1515,31 @@ async def toggle_memory(message: Message):
     )
     updated_user = get_user(message.from_user.id)
     await message.answer(text, reply_markup=settings_keyboard(updated_user))
+
+@dp.message(F.text == "♻️ Сбросить память")
+async def reset_memory_handler(message: Message):
+    clear_history(message.from_user.id)
+    await message.answer(
+        "✅ Память сброшена.\nИстория запросов по всем категориям очищена.",
+        reply_markup=settings_keyboard(get_user(message.from_user.id)),
+    )
+
+@dp.message(F.text == "✍️ Копировать стиль")
+async def copy_style_start(message: Message, state: FSMContext):
+    await state.set_state(SettingsStates.waiting_for_style_sample)
+    await message.answer(
+        "Пришли несколько своих постов.\n\n"
+        "Я проанализирую их и буду писать в похожем стиле ✍️",
+        reply_markup=settings_keyboard(get_user(message.from_user.id)),
+    )
+
+@dp.message(F.text == "🗑 Очистить стиль")
+async def clear_style(message: Message):
+    clear_style_samples(message.from_user.id)
+    await message.answer(
+        "✅ Примеры стиля очищены.\nТеперь буду опираться только на новые вводные.",
+        reply_markup=settings_keyboard(get_user(message.from_user.id)),
+    )
 
 @dp.message(SettingsStates.waiting_for_style_sample)
 async def receive_style_sample(message: Message, state: FSMContext):
@@ -1333,6 +1586,44 @@ async def handle_rewrite_prompt(message: Message, state: FSMContext):
     await start_generation_flow(message, CATEGORY_REWRITE, user_prompt)
 
 # =========================
+# TWO-STEP REFINEMENT INPUTS
+# =========================
+
+@dp.message(GenerationStates.waiting_for_audience_input)
+async def handle_audience_input(message: Message, state: FSMContext):
+    audience = (message.text or "").strip()
+    if not audience:
+        await message.answer("Напиши, для какой аудитории адаптировать текст.")
+        return
+
+    data = await state.get_data()
+    session_id = data.get("pending_session_id")
+    await state.clear()
+
+    if not session_id:
+        await message.answer("Не удалось найти сессию. Попробуй ещё раз.", reply_markup=main_menu_keyboard())
+        return
+
+    await _apply_refinement_from_message(message, session_id, "audience", extra=audience)
+
+@dp.message(GenerationStates.waiting_for_custom_refinement)
+async def handle_custom_refinement_input(message: Message, state: FSMContext):
+    instruction = (message.text or "").strip()
+    if not instruction:
+        await message.answer("Напиши свою инструкцию для правки.")
+        return
+
+    data = await state.get_data()
+    session_id = data.get("pending_session_id")
+    await state.clear()
+
+    if not session_id:
+        await message.answer("Не удалось найти сессию. Попробуй ещё раз.", reply_markup=main_menu_keyboard())
+        return
+
+    await _apply_refinement_from_message(message, session_id, "custom", extra=instruction)
+
+# =========================
 # INLINE NAVIGATION
 # =========================
 
@@ -1361,8 +1652,10 @@ async def copy_result_callback(callback: CallbackQuery):
         return
 
     await callback.answer("Отправляю текст отдельным сообщением 👌")
-    await callback.message.answer(f"📋 Вот текст для удобного копирования:\n\n{text}",
-                                  reply_markup=result_inline_keyboard(session_id))
+    await callback.message.answer(
+        f"📋 Вот текст для удобного копирования:\n\n{text}",
+        reply_markup=result_inline_keyboard(session_id),
+    )
 
 @dp.callback_query(F.data.startswith("refine:"))
 async def refine_callback(callback: CallbackQuery):
@@ -1377,23 +1670,11 @@ async def refine_callback(callback: CallbackQuery):
         await callback.answer("Сессия не найдена", show_alert=True)
         return
 
-    refinement_count = int(session.get("refinement_count", 0))
-    free_left = max(FREE_REFINEMENTS_COUNT - refinement_count, 0)
-
-    text = (
-        "✏️ Выберите, как доработать результат:\n\n"
-        "✂️ Короче — сокращает без потери смысла\n"
-        "📱 Под Telegram — делает живее и разговорнее\n"
-        "💰 Продающим — усиливает оффер и CTA\n"
-        "🎯 Добавить структуру — делает текст удобнее для чтения\n"
-        "✨ Улучшить стиль — усиливает формулировки"
-    )
-
-    if free_left > 0:
-        text += f"\n\n🎁 Бесплатных доработок осталось: {free_left}"
-
     await callback.answer()
-    await callback.message.answer(text, reply_markup=refinement_inline_keyboard(session_id))
+    await callback.message.answer(
+        get_refinement_menu_text(session),
+        reply_markup=refinement_inline_keyboard(session_id, session.get("category", CATEGORY_POST)),
+    )
 
 @dp.callback_query(F.data.startswith("regen:"))
 async def regenerate_callback(callback: CallbackQuery):
@@ -1405,13 +1686,43 @@ async def regenerate_callback(callback: CallbackQuery):
     await regenerate_from_session(callback, session_id)
 
 @dp.callback_query(F.data.startswith("refine_type:"))
-async def refine_type_callback(callback: CallbackQuery):
+async def refine_type_callback(callback: CallbackQuery, state: FSMContext):
     try:
-        _, session_id_str, refinement_type = callback.data.split(":")
-        session_id = int(session_id_str)
+        parts = callback.data.split(":")
+        session_id = int(parts[1])
+        refinement_type = parts[2]
     except Exception:
         await callback.answer("Не удалось применить доработку", show_alert=True)
         return
+
+    # Two-step refinements — ask for extra input first
+    if refinement_type == "audience":
+        await state.set_state(GenerationStates.waiting_for_audience_input)
+        await state.update_data(pending_session_id=session_id)
+        await callback.answer()
+        await callback.message.answer(
+            "🎯 Для какой аудитории адаптировать текст?\n\n"
+            "Например:\n"
+            "• предприниматели\n"
+            "• маркетологи\n"
+            "• владельцы Telegram-каналов"
+        )
+        return
+
+    if refinement_type == "custom":
+        await state.set_state(GenerationStates.waiting_for_custom_refinement)
+        await state.update_data(pending_session_id=session_id)
+        await callback.answer()
+        await callback.message.answer(
+            "✏️ Напишите свою инструкцию для правки.\n\n"
+            "Например:\n"
+            "• сделай дерзче\n"
+            "• добавь больше фактов\n"
+            "• сделай мягче"
+        )
+        return
+
+    # All other types — apply immediately
     await apply_refinement(callback, session_id, refinement_type)
 
 # =========================
