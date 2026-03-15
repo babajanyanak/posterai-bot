@@ -113,6 +113,10 @@ async def init_db() -> None:
             # migrations
             await cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN DEFAULT TRUE")
             await cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMP")
+            await cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS generations_left INT DEFAULT 10")
+            await cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tariff TEXT DEFAULT 'free'")
+            await cur.execute("UPDATE users SET generations_left = 10 WHERE generations_left IS NULL")
+            await cur.execute("UPDATE users SET tariff = 'free' WHERE tariff IS NULL")
 
             # user_history
             await cur.execute("""
