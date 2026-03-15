@@ -764,6 +764,7 @@ def get_refinement_instruction(refinement_type: str, extra: str = "") -> str:
         ),
         "selling": "Make the text more persuasive: strengthen the offer, highlight the value, increase the reader's motivation to act.",
         "lively": "Make the text more lively: lighter, more natural, more emotional. Remove dryness and bureaucratic language.",
+        "restrained": "Make the text more restrained and calm: remove hype, excessive emotions and exclamation marks. Keep the tone confident and professional.",
         "cta": "Add a clear call to action at the end. Choose the most fitting one: subscribe, write, try, visit — based on context.",
         "telegram": "Adapt the text for Telegram format: short paragraphs, conversational tone, easy to read on mobile.",
         "web": "Adapt the text for web format: structured paragraphs, neutral professional tone suitable for a website or news article.",
@@ -866,13 +867,14 @@ def refinement_inline_keyboard(session_id: int, category: str) -> InlineKeyboard
         ],
         [
             InlineKeyboardButton(text="✨ Живее", callback_data=f"refine_type:{session_id}:lively"),
+            InlineKeyboardButton(text="🤫 Сдержаннее", callback_data=f"refine_type:{session_id}:restrained"),
+        ],
+        [
             InlineKeyboardButton(text="📣 С CTA", callback_data=f"refine_type:{session_id}:cta"),
-        ],
-        [
             InlineKeyboardButton(text="📱 Под Telegram", callback_data=f"refine_type:{session_id}:telegram"),
-            InlineKeyboardButton(text="🌐 Для сайта", callback_data=f"refine_type:{session_id}:web"),
         ],
         [
+            InlineKeyboardButton(text="🌐 Для сайта", callback_data=f"refine_type:{session_id}:web"),
             InlineKeyboardButton(text="🎯 Для конкретной ЦА", callback_data=f"refine_type:{session_id}:audience"),
         ],
     ]
@@ -985,6 +987,7 @@ def get_refinement_menu_text(session: dict) -> str:
         "✂️ Короче — убирает лишнее, сокращает радикально\n"
         "💰 Продающим — усиливает оффер и мотивацию\n"
         "✨ Живее — легче, естественнее, эмоциональнее\n"
+        "🤫 Сдержаннее — убирает хайп, делает тон спокойнее\n"
         "📣 С CTA — добавляет призыв к действию\n"
         "📱 Под Telegram — адаптирует под формат\n"
         "🌐 Для сайта — адаптирует под веб-формат\n"
