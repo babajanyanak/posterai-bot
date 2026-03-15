@@ -3,3 +3,4 @@ aiohttp==3.10.11
 openai==1.57.4
 psycopg[binary]==3.2.3
 yookassa==3.1.0
+python-dotenv
