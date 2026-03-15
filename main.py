@@ -117,6 +117,18 @@ async def init_db() -> None:
             await cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tariff TEXT DEFAULT 'free'")
             await cur.execute("UPDATE users SET generations_left = 10 WHERE generations_left IS NULL")
             await cur.execute("UPDATE users SET tariff = 'free' WHERE tariff IS NULL")
+            # migrations for other tables
+            await cur.execute("ALTER TABLE user_history ADD COLUMN IF NOT EXISTS is_final BOOLEAN DEFAULT FALSE")
+            await cur.execute("ALTER TABLE user_history ADD COLUMN IF NOT EXISTS category TEXT")
+            await cur.execute("ALTER TABLE user_history ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+            await cur.execute("ALTER TABLE generation_sessions ADD COLUMN IF NOT EXISTS generated_text TEXT")
+            await cur.execute("ALTER TABLE generation_sessions ADD COLUMN IF NOT EXISTS original_prompt TEXT")
+            await cur.execute("ALTER TABLE generation_sessions ADD COLUMN IF NOT EXISTS category TEXT")
+            await cur.execute("ALTER TABLE generation_sessions ADD COLUMN IF NOT EXISTS refinement_count INT DEFAULT 0")
+            await cur.execute("ALTER TABLE generation_sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
+            await cur.execute("ALTER TABLE analytics_events ADD COLUMN IF NOT EXISTS meta JSONB")
+            await cur.execute("ALTER TABLE analytics_events ADD COLUMN IF NOT EXISTS value TEXT")
+            await cur.execute("ALTER TABLE analytics_events ADD COLUMN IF NOT EXISTS category TEXT")
 
             # user_history
             await cur.execute("""
