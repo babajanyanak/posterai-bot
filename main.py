@@ -1722,7 +1722,6 @@ async def handle_post_prompt(message: Message, state: FSMContext):
     if not user_prompt:
         await message.answer("Пришлите тему или вводные текстом ✍️")
         return
-    await state.clear()
     await state.update_data(pending_category=CATEGORY_POST, pending_prompt=user_prompt)
     await state.set_state(GenerationStates.waiting_for_web_search_confirm)
     await message.answer(
@@ -1736,7 +1735,6 @@ async def handle_ideas_prompt(message: Message, state: FSMContext):
     if not user_prompt:
         await message.answer("Пришлите тему, нишу или продукт текстом 💡")
         return
-    await state.clear()
     await state.update_data(pending_category=CATEGORY_IDEAS, pending_prompt=user_prompt)
     await state.set_state(GenerationStates.waiting_for_web_search_confirm)
     await message.answer(
