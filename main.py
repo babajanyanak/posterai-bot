@@ -1944,22 +1944,24 @@ def tariffs_inline_keyboard_for_user(username: Optional[str]) -> InlineKeyboardM
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# Переопределим выдачу тарифов с учетом скрытия Unlim для нужного пользователя
 @dp.message(F.text == "💳 Тарифы")
-async def menu_tariffs_v2(message: Message):
+async def menu_tariffs(message: Message):
+    logger.info("TARIFFS HANDLER TRIGGERED | text=%s | user_id=%s", message.text, message.from_user.id)
     user_id = message.from_user.id
     track_event(user_id, "payment_screen_opened", value="tariffs")
     await message.answer(
-        get_tariffs_text(get_user(user_id)),
+        get_tariffs_text(get_user(user_id), telegram_username=message.from_user.username),
         reply_markup=tariffs_inline_keyboard_for_user(message.from_user.username),
     )
 
+
 @dp.message(Command("tariffs"))
-async def cmd_tariffs_v2(message: Message):
+async def cmd_tariffs(message: Message):
+    logger.info("CMD TARIFFS HANDLER TRIGGERED | user_id=%s", message.from_user.id)
     user_id = message.from_user.id
     track_event(user_id, "payment_screen_opened", value="tariffs")
     await message.answer(
-        get_tariffs_text(get_user(user_id)),
+        get_tariffs_text(get_user(user_id), telegram_username=message.from_user.username),
         reply_markup=tariffs_inline_keyboard_for_user(message.from_user.username),
     )
 
@@ -2003,12 +2005,23 @@ if __name__ == "__main__":
 
 @dp.message()
 async def fallback_handler(message: Message, state: FSMContext):
+    logger.info("FALLBACK TRIGGERED | text=%s | user_id=%s", message.text, message.from_user.id)
+
     text = (message.text or "").strip()
 
-    await state.clear()
+    if not text:
+        await message.answer(
+            "Пока умею работать в текстовом формате 🙂",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
 
+    await state.clear()
     await message.answer(
         "Я готов помочь 👌\n\n"
-        "Выберите режим в меню:",
+        "Выберите режим в меню:\n"
+        "✍️ Сгенерировать пост\n"
+        "💡 Идеи постов\n"
+        "♻️ Переписать текст",
         reply_markup=main_menu_keyboard(),
     )
