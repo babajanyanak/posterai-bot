@@ -68,6 +68,8 @@ YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
 SPECIAL_RESET_USERNAME = "babajanyanak"
 SPECIAL_RESET_COMMAND = "/refresh_capsule_314"
 
+CURRENT_YEAR = 2026
+
 # =========================
 # LOGGING
 # =========================
@@ -100,6 +102,11 @@ class GenerationStates(StatesGroup):
 class SettingsStates(StatesGroup):
     waiting_for_style_sample = State()
 
+class ChannelContextStates(StatesGroup):
+    waiting_for_niche = State()
+    waiting_for_audience = State()
+    waiting_for_goal = State()
+
 # =========================
 # DB HELPERS
 # =========================
@@ -118,7 +125,17 @@ def init_db():
                     generations_left INT DEFAULT 10,
                     plan_expires_at TIMESTAMP,
                     memory_enabled BOOLEAN DEFAULT TRUE,
+                    user_style_profile TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_channel_context (
+                    telegram_id BIGINT PRIMARY KEY,
+                    niche TEXT,
+                    audience TEXT,
+                    goal TEXT,
+                    updated_at TIMESTAMP DEFAULT NOW()
                 )
             """)
             cur.execute("""
@@ -165,21 +182,12 @@ def init_db():
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             """)
-            # Stores full refinement history per session for multi-turn context
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS session_refinement_history (
                     id SERIAL PRIMARY KEY,
                     session_id INT,
                     role TEXT,
                     content TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS style_posts (
-                    id SERIAL PRIMARY KEY,
-                    telegram_id BIGINT,
-                    text TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             """)
@@ -205,6 +213,7 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS generations_left INT DEFAULT 10")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMP")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN DEFAULT TRUE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS user_style_profile TEXT")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
             cur.execute("ALTER TABLE user_history ADD COLUMN IF NOT EXISTS category TEXT")
             cur.execute("ALTER TABLE user_history ADD COLUMN IF NOT EXISTS role TEXT")
@@ -296,6 +305,17 @@ def set_memory_enabled(user_id: int, enabled: bool):
             cur.execute("UPDATE users SET memory_enabled=%s WHERE telegram_id=%s", (enabled, user_id))
         conn.commit()
 
+def save_user_style_profile(user_id: int, profile: str):
+    ensure_user_exists(user_id)
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET user_style_profile=%s WHERE telegram_id=%s", (profile, user_id))
+        conn.commit()
+
+def get_user_style_profile(user_id: int) -> Optional[str]:
+    user = get_user(user_id)
+    return user.get("user_style_profile")
+
 def is_subscription_active(user: dict) -> bool:
     plan_expires_at = user.get("plan_expires_at")
     if not plan_expires_at:
@@ -359,6 +379,38 @@ def add_generations(user_id: int, amount: int):
         conn.commit()
 
 # =========================
+# CHANNEL CONTEXT
+# =========================
+
+def save_channel_context(user_id: int, niche: str, audience: str, goal: str):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO user_channel_context (telegram_id, niche, audience, goal, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (telegram_id)
+                DO UPDATE SET niche=EXCLUDED.niche, audience=EXCLUDED.audience,
+                              goal=EXCLUDED.goal, updated_at=NOW()
+                """,
+                (user_id, niche, audience, goal),
+            )
+        conn.commit()
+
+def get_channel_context(user_id: int) -> Optional[dict]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM user_channel_context WHERE telegram_id=%s", (user_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+def clear_channel_context(user_id: int):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM user_channel_context WHERE telegram_id=%s", (user_id,))
+        conn.commit()
+
+# =========================
 # HISTORY / MEMORY / STYLE
 # =========================
 
@@ -371,24 +423,7 @@ def save_history(user_id: int, category: str, role: str, text: str, is_final: bo
             )
         conn.commit()
 
-def get_last_history_items(user_id: int, category: Optional[str] = None,
-                           limit: int = HISTORY_LIMIT_PER_CATEGORY) -> list[dict]:
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            if category:
-                cur.execute(
-                    "SELECT * FROM user_history WHERE telegram_id=%s AND category=%s ORDER BY created_at DESC LIMIT %s",
-                    (user_id, category, limit),
-                )
-            else:
-                cur.execute(
-                    "SELECT * FROM user_history WHERE telegram_id=%s ORDER BY created_at DESC LIMIT %s",
-                    (user_id, limit),
-                )
-            return [dict(r) for r in (cur.fetchall() or [])]
-
 def clear_history(user_id: int, category: Optional[str] = None):
-    """Delete history and category memory. Style samples are NOT touched."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             if category:
@@ -430,8 +465,10 @@ def clear_style_samples(user_id: int):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM user_style_samples WHERE telegram_id=%s", (user_id,))
         conn.commit()
+    # Also clear the generated style profile
+    save_user_style_profile(user_id, None)
 
-def get_style_samples(user_id: int, limit: int = 5) -> list[str]:
+def get_style_samples(user_id: int, limit: int = 10) -> list[str]:
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -455,7 +492,6 @@ def create_generation_session(user_id: int, category: str, original_prompt: str,
             row = cur.fetchone()
         conn.commit()
     session_id = int(row["id"])
-    # Save the initial generated text as first assistant message in refinement history
     save_refinement_history(session_id, "assistant", generated_text)
     return session_id
 
@@ -481,10 +517,6 @@ def update_generation_session_text(session_id: int, generated_text: str, increme
                 )
         conn.commit()
 
-# =========================
-# SESSION REFINEMENT HISTORY (multi-turn context)
-# =========================
-
 def save_refinement_history(session_id: int, role: str, content: str):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -495,7 +527,6 @@ def save_refinement_history(session_id: int, role: str, content: str):
         conn.commit()
 
 def get_refinement_history(session_id: int) -> list[dict]:
-    """Returns full conversation history for this session ordered oldest first."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -508,8 +539,7 @@ def get_refinement_history(session_id: int) -> list[dict]:
 # PAYMENTS
 # =========================
 
-def create_payment_record(user_id: int, amount: int, tariff: str, status: str,
-                          payment_id: Optional[str] = None, generations: Optional[int] = None):
+def create_payment_record(user_id: int, amount: int, tariff: str, status: str, payment_id: Optional[str] = None):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -535,102 +565,213 @@ def get_payment_by_payment_id(payment_id: str) -> Optional[dict]:
             return dict(row) if row else None
 
 # =========================
-# TEXT / PROMPTS HELPERS
+# PROMPT ENGINEERING
 # =========================
 
-def get_system_prompt(category: str) -> str:
-    base = (
-        "Ты сильный русскоязычный редактор и контент-стратег. "
-        "Пишешь понятно, живо, по делу, без канцелярита. "
-        "Учитывай, что тексты нужны для Telegram и digital-среды. "
-        "Если уместно, делай текст более вовлекающим, но без перегиба."
-    )
-    if category == CATEGORY_POST:
-        return base + (
-            " Сгенерируй готовый пост на русском языке. "
-            "Он должен быть читабельным, современным, с хорошей структурой, "
-            "естественными абзацами и сильным первым экраном."
-        )
-    if category == CATEGORY_IDEAS:
-        return base + (
-            " Сгенерируй список идей постов на русском языке. "
-            "Идеи должны быть конкретными, небанальными и пригодными для Telegram. "
-            "Пронумеруй их."
-        )
-    if category == CATEGORY_REWRITE:
-        return base + (
-            " Перепиши текст на русском языке. "
-            "Сохраняй смысл, но делай подачу сильнее, чище и удобнее для восприятия."
-        )
-    return base
+# --- Base system prompt ---
+BASE_SYSTEM_PROMPT = f"""You are a professional social media content writer.
+You specialize in writing engaging posts for Telegram channels and other social platforms.
+You always write in Russian unless explicitly asked otherwise.
 
-def build_user_prompt(category: str, user_prompt: str,
-                      memory_text: Optional[str] = None,
-                      style_samples: Optional[list] = None) -> str:
+Your task is to generate high-quality content that is engaging, easy to read, structured for social media and optimized for audience attention.
+
+Rules:
+1. Write concise and natural text.
+2. Use short paragraphs (1–2 sentences).
+3. Avoid generic AI phrases like "В современном мире", "Не секрет, что", "Давайте разберёмся".
+4. Avoid outdated references unless the user explicitly asks.
+5. Focus on clarity and value for the reader.
+6. Adapt tone of voice if the user provided style examples.
+7. Prefer modern style suitable for Telegram and social media.
+8. Do not add meta-commentary — return only the final text.
+
+Post structure: Hook → Main idea → Value → Optional call to action.
+
+Formatting:
+- Short paragraphs
+- Optional emoji (not too many, only if natural)
+- Readable structure
+
+Always prioritize natural human-like writing.
+Current year: {CURRENT_YEAR}"""
+
+
+def build_system_messages(user_id: int) -> list[dict]:
+    """
+    Build the full system message list:
+    1. Base system prompt
+    2. User style profile (if exists and memory enabled)
+    3. Channel context (if exists)
+    """
+    user = get_user(user_id)
+    memory_enabled = bool(user.get("memory_enabled", True))
+    messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
+
+    # Style profile
+    style_profile = get_user_style_profile(user_id) if memory_enabled else None
+    if style_profile:
+        messages.append({
+            "role": "system",
+            "content": f"User writing style profile:\n{style_profile}"
+        })
+
+    # Channel context
+    ctx = get_channel_context(user_id)
+    if ctx:
+        ctx_text = (
+            f"Channel context:\n"
+            f"- Niche: {ctx.get('niche', '—')}\n"
+            f"- Audience: {ctx.get('audience', '—')}\n"
+            f"- Content goal: {ctx.get('goal', '—')}"
+        )
+        messages.append({"role": "system", "content": ctx_text})
+
+    return messages
+
+
+def build_post_prompt(user_prompt: str, memory_text: Optional[str] = None) -> str:
     parts = []
     if memory_text:
-        parts.append(f"Контекст прошлой генерации пользователя по этой категории:\n{memory_text}")
-    if style_samples:
-        joined = "\n\n---\n\n".join(style_samples)
-        parts.append(
-            "Примеры пользовательского стиля. "
-            "Не копируй слово в слово, но учитывай ритм, подачу и тон:\n" + joined
-        )
-    if category == CATEGORY_POST:
-        parts.append(f"Задача: создать пост по теме:\n{user_prompt}")
-    elif category == CATEGORY_IDEAS:
-        parts.append(f"Задача: придумать идеи постов по теме/нише:\n{user_prompt}")
-    elif category == CATEGORY_REWRITE:
-        parts.append(f"Задача: переписать этот текст:\n{user_prompt}")
-    else:
-        parts.append(user_prompt)
-    return "\n\n".join(parts)
+        parts.append(f"Context from previous session:\n{memory_text}\n")
+    parts.append(f"""Create a social media post.
+
+Topic:
+{user_prompt}
+
+Platform:
+Telegram
+
+Goal:
+engaging post that delivers value
+
+Requirements:
+- strong hook in the first line
+- practical value for the reader
+- clear structure with short paragraphs
+- concise and natural language
+- optional emoji if appropriate""")
+    return "\n".join(parts)
+
+
+def build_post_outline_prompt(user_prompt: str) -> str:
+    return f"""Create a brief outline for a Telegram post.
+
+Topic:
+{user_prompt}
+
+Return only the outline — 3–5 bullet points covering:
+- Hook idea
+- Main point
+- Supporting argument or example
+- Value / takeaway
+- Optional CTA
+
+No extra commentary, just the outline."""
+
+
+def build_post_from_outline_prompt(user_prompt: str, outline: str, memory_text: Optional[str] = None) -> str:
+    parts = []
+    if memory_text:
+        parts.append(f"Context from previous session:\n{memory_text}\n")
+    parts.append(f"""Write a Telegram post based on the following outline.
+
+Topic:
+{user_prompt}
+
+Outline:
+{outline}
+
+Requirements:
+- strong hook in the first line
+- short paragraphs (1–2 sentences each)
+- practical value for the reader
+- natural, human-like language
+- optional emoji if appropriate
+- do not copy the outline literally — write naturally
+
+Return only the final post text.""")
+    return "\n".join(parts)
+
+
+def build_ideas_prompt(user_prompt: str, memory_text: Optional[str] = None) -> str:
+    parts = []
+    if memory_text:
+        parts.append(f"Context from previous session:\n{memory_text}\n")
+    parts.append(f"""Generate 10 content ideas for a Telegram channel.
+
+Topic / niche:
+{user_prompt}
+
+Platform:
+Telegram
+
+Each idea should:
+- be specific and concrete
+- have an attention-grabbing angle
+- be suitable for social media format
+- avoid generic or obvious topics
+
+Format: numbered list, one idea per line, short title + one sentence description.""")
+    return "\n".join(parts)
+
+
+def build_rewrite_prompt(user_prompt: str) -> str:
+    return f"""Rewrite the following text.
+
+Goals:
+- improve clarity and readability
+- improve engagement
+- adapt for social media (Telegram format)
+- keep the original meaning intact
+- remove bureaucratic language and clichés
+
+Style:
+Short paragraphs, natural language, suitable for Telegram.
+
+Text:
+{user_prompt}
+
+Return only the rewritten text."""
+
+
+def build_style_analysis_prompt(samples: list[str]) -> str:
+    joined = "\n\n---\n\n".join(samples)
+    return f"""Analyze the writing style of the following texts written by the same author.
+
+Extract and describe:
+- Tone of voice (e.g. friendly, expert, casual, formal)
+- Formality level (formal / semi-casual / casual)
+- Sentence length (short / medium / long)
+- Emoji usage (none / rare / moderate / frequent)
+- Typical post structure (e.g. hook → story → takeaway)
+- Writing patterns and habits (e.g. uses lists, rhetorical questions, personal stories)
+- Vocabulary style (simple / professional / slang)
+
+Return a concise style profile in plain text. No bullet point headers needed — write naturally in 5–8 sentences.
+
+Texts:
+{joined}"""
+
 
 def get_refinement_instruction(refinement_type: str, extra: str = "") -> str:
-    """Returns just the instruction string for a refinement type."""
     mapping = {
         "shorter": (
-            "Сократи текст радикально — убери всё второстепенное, оставь только суть. "
-            "Текст должен стать заметно короче, а не чуть-чуть."
+            "Shorten the text significantly. Remove everything secondary — keep only the core message. "
+            "The result must be noticeably shorter, not just slightly trimmed."
         ),
-        "selling": (
-            "Сделай текст более продающим: усили оффер, ценность и мотивацию читателя."
-        ),
-        "lively": (
-            "Сделай текст живее: легче, естественнее и эмоциональнее. Убери сухость и канцелярит."
-        ),
-        "cta": (
-            "Добавь в текст чёткий призыв к действию (CTA). "
-            "Например: подпишись, напиши, попробуй, перейди — выбери подходящий по контексту."
-        ),
-        "telegram": (
-            "Адаптируй текст под формат Telegram: "
-            "короткие абзацы, удобный ритм, разговорный стиль, высокая читаемость с телефона."
-        ),
-        "web": (
-            "Адаптируй текст под веб-формат: структурированные абзацы, подходящий тон для сайта или новостного топика, "
-            "без излишней разговорности, с чётким изложением."
-        ),
-        "audience": (
-            f"Адаптируй текст для следующей аудитории: {extra}. Учти их язык, боли и интересы."
-        ),
-        "deeper": (
-            "Сделай идеи менее банальными и более содержательными. "
-            "Добавь экспертную глубину и нестандартные углы."
-        ),
-        "bolder": (
-            "Сделай идеи провокационнее, ярче и цепляющими. Не бойся смелых формулировок."
-        ),
-        "cleaner": (
-            "Сделай текст чище: убери канцелярит, упрости язык, сделай его легче для восприятия."
-        ),
-        "structure": (
-            "Улучши структуру текста: добавь логические блоки, "
-            "улучши последовательность, сделай текст более читабельным."
-        ),
+        "selling": "Make the text more persuasive: strengthen the offer, highlight the value, increase the reader's motivation to act.",
+        "lively": "Make the text more lively: lighter, more natural, more emotional. Remove dryness and bureaucratic language.",
+        "cta": "Add a clear call to action at the end. Choose the most fitting one: subscribe, write, try, visit — based on context.",
+        "telegram": "Adapt the text for Telegram format: short paragraphs, conversational tone, easy to read on mobile.",
+        "web": "Adapt the text for web format: structured paragraphs, neutral professional tone suitable for a website or news article.",
+        "audience": f"Adapt the text for the following audience: {extra}. Consider their language, pain points and interests.",
+        "deeper": "Make the ideas less obvious and more insightful. Add expert depth and non-standard angles.",
+        "bolder": "Make the ideas more provocative, vivid and attention-grabbing. Don't be afraid of bold statements.",
+        "cleaner": "Clean up the text: remove bureaucratic language, simplify wording, make it easier to read.",
+        "structure": "Improve the structure: add logical blocks, improve the flow, make the text easier to scan.",
         "custom": extra,
     }
-    return mapping.get(refinement_type, "Улучши текст.")
+    return mapping.get(refinement_type, "Improve the text.")
 
 # =========================
 # KEYBOARDS
@@ -651,6 +792,7 @@ def settings_keyboard(user: dict) -> ReplyKeyboardMarkup:
     memory_button = "✅ Память включена" if memory_enabled else "⛔ Память выключена"
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="📡 Настроить канал")],
             [KeyboardButton(text=memory_button)],
             [KeyboardButton(text="♻️ Сбросить память")],
             [KeyboardButton(text="✍️ Копировать стиль")],
@@ -658,6 +800,15 @@ def settings_keyboard(user: dict) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="⬅️ Назад в меню")],
         ],
         resize_keyboard=True,
+    )
+
+def channel_context_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data="channel_context_edit")],
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data="channel_context_clear")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="channel_context_back")],
+        ]
     )
 
 def style_sample_keyboard() -> InlineKeyboardMarkup:
@@ -769,12 +920,10 @@ def get_tariffs_text(user: dict, telegram_username: Optional[str] = None) -> str
         "💳 Тарифы PosteraAI", "",
         "Free",
         f"• {FREE_GENERATIONS_DEFAULT} генераций на старте",
-        "• Базовые режимы",
         "• Первые 2 настройки не расходуют генерации", "",
         "Creator — 349 ₽/мес",
         f"• {CREATOR_GENERATIONS_DEFAULT} генераций в месяц",
-        "• Подходит для регулярной работы",
-        "• Удобно для контент-потока", "",
+        "• Подходит для регулярной работы", "",
         "Unlim — 799 ₽/мес",
         "• Безлимитные генерации",
         "• Для активного ежедневного использования", "",
@@ -788,11 +937,29 @@ def get_tariffs_text(user: dict, telegram_username: Optional[str] = None) -> str
 def get_settings_text(user: dict) -> str:
     memory_enabled = "включена" if bool(user.get("memory_enabled", True)) else "выключена"
     style_count = len(get_style_samples(user["telegram_id"]))
+    has_profile = bool(get_user_style_profile(user["telegram_id"]))
+    ctx = get_channel_context(user["telegram_id"])
+    ctx_text = f"{ctx['niche']} · {ctx['audience']} · {ctx['goal']}" if ctx else "не настроен"
+    profile_text = "есть" if has_profile else "нет"
     return (
         "⚙️ Настройка бота\n\n"
+        f"📡 Контекст канала: {ctx_text}\n"
         f"🧠 Память: {memory_enabled}\n"
-        f"✍️ Примеров стиля сохранено: {style_count}\n\n"
-        "Здесь можно управлять памятью, добавить примеры своих текстов или очистить стиль."
+        f"✍️ Примеров стиля: {style_count} · Профиль стиля: {profile_text}\n\n"
+        "Здесь можно настроить канал, управлять памятью и стилем."
+    )
+
+def get_channel_context_text(ctx: Optional[dict]) -> str:
+    if not ctx:
+        return (
+            "📡 Контекст канала не настроен.\n\n"
+            "Укажи нишу, аудиторию и цель — и я буду учитывать это в каждой генерации."
+        )
+    return (
+        f"📡 Контекст канала\n\n"
+        f"Ниша: {ctx.get('niche', '—')}\n"
+        f"Аудитория: {ctx.get('audience', '—')}\n"
+        f"Цель контента: {ctx.get('goal', '—')}"
     )
 
 def get_prompt_request_text(category: str) -> str:
@@ -811,7 +978,6 @@ def get_refinement_menu_text(session: dict) -> str:
     refinement_count = int(session.get("refinement_count", 0))
     free_left = max(FREE_REFINEMENTS_COUNT - refinement_count, 0)
     category = session.get("category", "")
-
     base_options = (
         "✂️ Короче — убирает лишнее, сокращает радикально\n"
         "💰 Продающим — усиливает оффер и мотивацию\n"
@@ -826,9 +992,7 @@ def get_refinement_menu_text(session: dict) -> str:
         extra = "🧠 Глубже — менее банально, экспертнее\n⚡ Смелее — провокационнее и ярче\n"
     elif category == CATEGORY_REWRITE:
         extra = "🧼 Чище — убирает канцелярит\n🧱 Структурнее — улучшает логику и блоки\n"
-
     text = f"✏️ Выберите, как доработать результат:\n\n{base_options}{extra}✏️ Своя правка — напиши свою инструкцию"
-
     if free_left > 0:
         text += f"\n\nВы можете настроить ответ под себя. Первые {FREE_REFINEMENTS_COUNT} настройки не расходуют генерации. Осталось бесплатно: {free_left}"
     return text
@@ -847,16 +1011,17 @@ async def send_main_menu_from_callback(callback: CallbackQuery, text: str):
     await callback.message.answer(text, reply_markup=main_menu_keyboard())
 
 # =========================
-# OPENAI / GENERATION
+# OPENAI CALLS
 # =========================
 
-def call_openai_text(system_prompt: str, messages: list) -> str:
-    """Call OpenAI with a full messages list (supports multi-turn)."""
-    full_messages = [{"role": "system", "content": system_prompt}] + messages
+def call_openai(system_messages: list[dict], user_messages: list[dict],
+                max_tokens: int = 600, temperature: float = 0.7) -> str:
+    messages = system_messages + user_messages
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=full_messages,
-        temperature=0.7,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
     )
     if not response.choices:
         raise RuntimeError("OpenAI не вернул choices")
@@ -865,65 +1030,98 @@ def call_openai_text(system_prompt: str, messages: list) -> str:
         raise RuntimeError("OpenAI не вернул текстовый ответ")
     return msg.content.strip()
 
-def call_openai_simple(system_prompt: str, user_prompt: str) -> str:
-    """Simple single-turn call."""
-    return call_openai_text(system_prompt, [{"role": "user", "content": user_prompt}])
 
-def build_generation_payload(user_id: int, category: str, user_prompt: str) -> tuple[str, str]:
+async def analyze_style_and_save(user_id: int, samples: list[str]):
+    """Analyze style samples and save the resulting profile."""
+    prompt = build_style_analysis_prompt(samples)
+    system = [{"role": "system", "content": "You are an expert writing style analyst. Be concise and specific."}]
+    user_msgs = [{"role": "user", "content": prompt}]
+    profile = await asyncio.to_thread(call_openai, system, user_msgs, 300, 0.3)
+    save_user_style_profile(user_id, profile)
+    logger.info("Style profile saved for user_id=%s", user_id)
+    return profile
+
+
+async def run_generation(user_id: int, category: str, user_prompt: str) -> str:
+    system_messages = build_system_messages(user_id)
     user = get_user(user_id)
     memory_enabled = bool(user.get("memory_enabled", True))
     memory_text = get_category_memory(user_id, category) if memory_enabled else None
-    # Style samples: always use them regardless of memory toggle (separate setting)
-    style_samples = get_style_samples(user_id, limit=5)
-    system_prompt = get_system_prompt(category)
-    final_user_prompt = build_user_prompt(
-        category=category,
-        user_prompt=user_prompt,
-        memory_text=memory_text,
-        style_samples=style_samples,
-    )
-    return system_prompt, final_user_prompt
 
-async def run_generation(user_id: int, category: str, user_prompt: str) -> str:
-    system_prompt, final_user_prompt = build_generation_payload(user_id, category, user_prompt)
-    logger.info("OpenAI generation started | user_id=%s | category=%s", user_id, category)
-    result = await asyncio.to_thread(call_openai_simple, system_prompt, final_user_prompt)
+    if category == CATEGORY_POST:
+        # Two-step: outline → post
+        outline_prompt = build_post_outline_prompt(user_prompt)
+        logger.info("OpenAI outline started | user_id=%s", user_id)
+        outline = await asyncio.to_thread(
+            call_openai, system_messages,
+            [{"role": "user", "content": outline_prompt}],
+            200, 0.5,
+        )
+        logger.info("OpenAI outline done | user_id=%s", user_id)
+
+        post_prompt = build_post_from_outline_prompt(user_prompt, outline, memory_text)
+        result = await asyncio.to_thread(
+            call_openai, system_messages,
+            [{"role": "user", "content": post_prompt}],
+            600, 0.7,
+        )
+
+    elif category == CATEGORY_IDEAS:
+        prompt = build_ideas_prompt(user_prompt, memory_text)
+        result = await asyncio.to_thread(
+            call_openai, system_messages,
+            [{"role": "user", "content": prompt}],
+            800, 0.9,
+        )
+
+    elif category == CATEGORY_REWRITE:
+        prompt = build_rewrite_prompt(user_prompt)
+        result = await asyncio.to_thread(
+            call_openai, system_messages,
+            [{"role": "user", "content": prompt}],
+            600, 0.7,
+        )
+
+    else:
+        result = await asyncio.to_thread(
+            call_openai, system_messages,
+            [{"role": "user", "content": user_prompt}],
+            600, 0.7,
+        )
+
     logger.info("OpenAI generation success | user_id=%s | category=%s", user_id, category)
     return result
 
+
 async def run_refinement(session_id: int, refinement_type: str, extra: str = "") -> str:
-    """
-    Run a refinement using full multi-turn history so each iteration builds on all previous ones.
-    The history stored in session_refinement_history looks like:
-      assistant: <initial text>
-      user: <refinement instruction 1>
-      assistant: <refined text 1>
-      user: <refinement instruction 2>
-      ...
-    """
+    """Multi-turn refinement using full session history."""
     history = get_refinement_history(session_id)
     instruction = get_refinement_instruction(refinement_type, extra)
 
-    # Build messages for OpenAI: existing history + new user instruction
     messages = [{"role": h["role"], "content": h["content"]} for h in history]
     messages.append({"role": "user", "content": instruction})
 
-    system_prompt = (
-        "Ты сильный русскоязычный редактор. "
-        "Учитывай всю историю правок этого текста. "
-        "Каждая новая инструкция применяется к последней версии текста с учётом всего контекста. "
-        "Отвечай только готовым финальным текстом на русском языке без комментариев."
-    )
+    system = [{
+        "role": "system",
+        "content": (
+            "You are a professional Russian-language editor. "
+            "You have the full history of this text and all previous edits. "
+            "Apply the new instruction to the latest version of the text, taking all context into account. "
+            "Return only the final text in Russian. No commentary."
+        )
+    }]
 
     logger.info("OpenAI refinement started | session_id=%s | type=%s", session_id, refinement_type)
-    result = await asyncio.to_thread(call_openai_text, system_prompt, messages)
+    result = await asyncio.to_thread(call_openai, system, messages, 600, 0.7)
     logger.info("OpenAI refinement success | session_id=%s", session_id)
 
-    # Save instruction and result to history
     save_refinement_history(session_id, "user", instruction)
     save_refinement_history(session_id, "assistant", result)
-
     return result
+
+# =========================
+# GENERATION FLOW
+# =========================
 
 async def start_generation_flow(message: Message, category: str, user_prompt: str):
     user_id = message.from_user.id
@@ -964,6 +1162,7 @@ async def start_generation_flow(message: Message, category: str, user_prompt: st
         await wait_msg.delete()
         await message.answer("Кажется произошла ошибка 😅 Попробуем ещё раз?", reply_markup=main_menu_keyboard())
 
+
 async def regenerate_from_session(callback: CallbackQuery, session_id: int):
     session = get_generation_session(session_id)
     if not session:
@@ -986,21 +1185,22 @@ async def regenerate_from_session(callback: CallbackQuery, session_id: int):
 
     try:
         result_text = await run_generation(user_id, session["category"], session["original_prompt"])
-        # Reset session: new text, reset refinement history
         update_generation_session_text(session_id, result_text, increment_refinement=False)
+        # Reset refinement history for new variant
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM session_refinement_history WHERE session_id=%s", (session_id,))
-            conn.commit()
-        save_refinement_history(session_id, "assistant", result_text)
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
                 cur.execute("UPDATE generation_sessions SET refinement_count=0 WHERE id=%s", (session_id,))
             conn.commit()
+        save_refinement_history(session_id, "assistant", result_text)
         save_history(user_id, session["category"], "assistant", result_text, is_final=True)
+
         track_event(user_id, "generation_success", category=session["category"], value="regenerate")
         await wait_msg.delete()
-        await callback.message.answer(f"🔁 Другой вариант готов:\n\n{result_text}", reply_markup=result_inline_keyboard(session_id))
+        await callback.message.answer(
+            f"🔁 Другой вариант готов:\n\n{result_text}",
+            reply_markup=result_inline_keyboard(session_id),
+        )
         await callback.message.answer(
             "Вы можете настроить ответ под себя. Первые 2 настройки не расходуют генерации.",
             reply_markup=main_menu_keyboard(),
@@ -1010,6 +1210,7 @@ async def regenerate_from_session(callback: CallbackQuery, session_id: int):
         await wait_msg.delete()
         await callback.message.answer("Кажется произошла ошибка 😅 Попробуем ещё раз?", reply_markup=main_menu_keyboard())
 
+
 def refinement_requires_generation(user_id: int, session: dict) -> bool:
     if int(session.get("refinement_count", 0)) < FREE_REFINEMENTS_COUNT:
         return False
@@ -1018,6 +1219,7 @@ def refinement_requires_generation(user_id: int, session: dict) -> bool:
         return False
     return True
 
+
 async def apply_refinement(callback: CallbackQuery, session_id: int, refinement_type: str, extra: str = ""):
     session = get_generation_session(session_id)
     if not session:
@@ -1025,7 +1227,6 @@ async def apply_refinement(callback: CallbackQuery, session_id: int, refinement_
         return
 
     user_id = callback.from_user.id
-
     need_gen = refinement_requires_generation(user_id, session)
     if need_gen:
         refresh_expired_plan_if_needed(user_id)
@@ -1052,10 +1253,8 @@ async def apply_refinement(callback: CallbackQuery, session_id: int, refinement_
         await wait_msg.delete()
         await callback.message.answer(f"✨ Обновил результат:\n\n{result_text}", reply_markup=result_inline_keyboard(session_id))
 
-        # Re-fetch session to get updated count
-        updated_session = get_generation_session(session_id)
-        refinement_count_after = int(updated_session.get("refinement_count", 0))
-        free_left = max(FREE_REFINEMENTS_COUNT - refinement_count_after, 0)
+        updated = get_generation_session(session_id)
+        free_left = max(FREE_REFINEMENTS_COUNT - int(updated.get("refinement_count", 0)), 0)
         if free_left > 0:
             await callback.message.answer(
                 f"Вы можете настроить ответ под себя. Осталось бесплатных настроек: {free_left}",
@@ -1068,15 +1267,14 @@ async def apply_refinement(callback: CallbackQuery, session_id: int, refinement_
         await wait_msg.delete()
         await callback.message.answer("Кажется произошла ошибка 😅 Попробуем ещё раз?", reply_markup=main_menu_keyboard())
 
+
 async def apply_refinement_from_message(message: Message, session_id: int, refinement_type: str, extra: str = ""):
-    """Same as apply_refinement but triggered from a Message (two-step flow)."""
     session = get_generation_session(session_id)
     if not session:
         await message.answer("Сессия не найдена.", reply_markup=main_menu_keyboard())
         return
 
     user_id = message.from_user.id
-
     need_gen = refinement_requires_generation(user_id, session)
     if need_gen:
         refresh_expired_plan_if_needed(user_id)
@@ -1101,9 +1299,8 @@ async def apply_refinement_from_message(message: Message, session_id: int, refin
         await wait_msg.delete()
         await message.answer(f"✨ Обновил результат:\n\n{result_text}", reply_markup=result_inline_keyboard(session_id))
 
-        updated_session = get_generation_session(session_id)
-        refinement_count_after = int(updated_session.get("refinement_count", 0))
-        free_left = max(FREE_REFINEMENTS_COUNT - refinement_count_after, 0)
+        updated = get_generation_session(session_id)
+        free_left = max(FREE_REFINEMENTS_COUNT - int(updated.get("refinement_count", 0)), 0)
         if free_left > 0:
             await message.answer(
                 f"Вы можете настроить ответ под себя. Осталось бесплатных настроек: {free_left}",
@@ -1141,7 +1338,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "🧠 Помогать структурировать идеи для контента\n\n"
         "Я подстраиваюсь под ваш стиль\n\n"
         "Вы можете:\n"
-        "• настроить формат ответов\n"
+        "• настроить контекст вашего канала\n"
         "• задать tone of voice\n"
         "• прислать примеры своих текстов\n"
         "Я проанализирую их и буду генерировать тексты в вашем стиле.\n\n"
@@ -1195,7 +1392,8 @@ async def cmd_special_reset(message: Message):
         return
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE users SET generations_left=%s WHERE telegram_id=%s", (FREE_GENERATIONS_DEFAULT, message.from_user.id))
+            cur.execute("UPDATE users SET generations_left=%s WHERE telegram_id=%s",
+                        (FREE_GENERATIONS_DEFAULT, message.from_user.id))
         conn.commit()
     await message.answer("✅ Лимит обновлён. Можно продолжать работу 😉", reply_markup=main_menu_keyboard())
 
@@ -1259,11 +1457,10 @@ async def toggle_memory(message: Message):
     user = get_user(message.from_user.id)
     new_value = not bool(user.get("memory_enabled", True))
     set_memory_enabled(message.from_user.id, new_value)
-    # History and style are preserved — only the flag changes
     text = (
-        "🧠 Память включена.\nБуду учитывать прошлый контекст в этой категории."
+        "🧠 Память включена.\nБуду учитывать прошлый контекст и стиль."
         if new_value
-        else "🧠 Память выключена.\nНовые генерации будут без учёта прошлого контекста.\nИстория и стиль сохранены — при включении вернутся."
+        else "🧠 Память выключена.\nНовые генерации без учёта прошлого контекста.\nИстория и стиль сохранены — при включении вернутся."
     )
     await message.answer(text, reply_markup=settings_keyboard(get_user(message.from_user.id)))
 
@@ -1279,8 +1476,7 @@ async def reset_memory_handler(message: Message):
 async def copy_style_start(message: Message, state: FSMContext):
     await state.set_state(SettingsStates.waiting_for_style_sample)
     await message.answer(
-        "Пришли пример своего текста.\n\n"
-        "Я сохраню его и буду писать в похожем стиле ✍️",
+        "Пришли пример своего текста.\n\nЯ сохраню его и проанализирую твой стиль ✍️",
         reply_markup=settings_keyboard(get_user(message.from_user.id)),
     )
 
@@ -1288,7 +1484,7 @@ async def copy_style_start(message: Message, state: FSMContext):
 async def clear_style(message: Message):
     clear_style_samples(message.from_user.id)
     await message.answer(
-        "✅ Примеры стиля очищены.\nТеперь буду опираться только на новые вводные.",
+        "✅ Примеры стиля и профиль очищены.\nТеперь буду опираться только на новые вводные.",
         reply_markup=settings_keyboard(get_user(message.from_user.id)),
     )
 
@@ -1299,11 +1495,101 @@ async def receive_style_sample(message: Message, state: FSMContext):
         await message.answer("Нужен именно текстовый пример ✍️")
         return
     add_style_sample(message.from_user.id, text)
-    # Stay in state, show add more / done buttons
     style_count = len(get_style_samples(message.from_user.id))
     await message.answer(
-        f"✅ Сохранил пример стиля ({style_count} шт.).\n\nМожешь прислать ещё или нажать «Готово».",
+        f"✅ Сохранил пример ({style_count} шт.).\n\nМожешь прислать ещё или нажать «Готово» — я проанализирую стиль.",
         reply_markup=style_sample_keyboard(),
+    )
+
+# =========================
+# CHANNEL CONTEXT HANDLERS
+# =========================
+
+@dp.message(F.text == "📡 Настроить канал")
+async def menu_channel_context(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    ctx = get_channel_context(user_id)
+    await message.answer(
+        get_channel_context_text(ctx),
+        reply_markup=channel_context_keyboard(),
+    )
+
+@dp.callback_query(F.data == "channel_context_edit")
+async def channel_context_edit(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ChannelContextStates.waiting_for_niche)
+    await callback.answer()
+    await callback.message.answer(
+        "📡 Настроим контекст канала.\n\n"
+        "Шаг 1 из 3\n"
+        "Какая ниша вашего канала?\n\n"
+        "Например: маркетинг, недвижимость, IT, финансы, фитнес"
+    )
+
+@dp.callback_query(F.data == "channel_context_clear")
+async def channel_context_clear_callback(callback: CallbackQuery):
+    clear_channel_context(callback.from_user.id)
+    await callback.answer()
+    await callback.message.answer(
+        "✅ Контекст канала удалён.",
+        reply_markup=settings_keyboard(get_user(callback.from_user.id)),
+    )
+
+@dp.callback_query(F.data == "channel_context_back")
+async def channel_context_back(callback: CallbackQuery):
+    await callback.answer()
+    user = get_user(callback.from_user.id)
+    await callback.message.answer(get_settings_text(user), reply_markup=settings_keyboard(user))
+
+@dp.message(ChannelContextStates.waiting_for_niche)
+async def handle_niche_input(message: Message, state: FSMContext):
+    niche = (message.text or "").strip()
+    if not niche:
+        await message.answer("Напиши нишу канала текстом.")
+        return
+    await state.update_data(niche=niche)
+    await state.set_state(ChannelContextStates.waiting_for_audience)
+    await message.answer(
+        "Шаг 2 из 3\n"
+        "Кто ваша аудитория?\n\n"
+        "Например: предприниматели, маркетологи, молодые мамы, IT-специалисты"
+    )
+
+@dp.message(ChannelContextStates.waiting_for_audience)
+async def handle_audience_context_input(message: Message, state: FSMContext):
+    audience = (message.text or "").strip()
+    if not audience:
+        await message.answer("Напиши аудиторию канала текстом.")
+        return
+    await state.update_data(audience=audience)
+    await state.set_state(ChannelContextStates.waiting_for_goal)
+    await message.answer(
+        "Шаг 3 из 3\n"
+        "Какая цель вашего контента?\n\n"
+        "Например: рост экспертизы, продажи, вовлечённость, обучение аудитории"
+    )
+
+@dp.message(ChannelContextStates.waiting_for_goal)
+async def handle_goal_input(message: Message, state: FSMContext):
+    goal = (message.text or "").strip()
+    if not goal:
+        await message.answer("Напиши цель контента текстом.")
+        return
+    data = await state.get_data()
+    await state.clear()
+
+    user_id = message.from_user.id
+    save_channel_context(user_id, data["niche"], data["audience"], goal)
+    track_event(user_id, "channel_context_saved")
+
+    ctx = get_channel_context(user_id)
+    await message.answer(
+        f"✅ Контекст канала сохранён!\n\n"
+        f"Ниша: {ctx['niche']}\n"
+        f"Аудитория: {ctx['audience']}\n"
+        f"Цель: {ctx['goal']}\n\n"
+        "Теперь буду учитывать это в каждой генерации 🎯",
+        reply_markup=settings_keyboard(get_user(user_id)),
     )
 
 # =========================
@@ -1320,12 +1606,31 @@ async def style_add_more_callback(callback: CallbackQuery, state: FSMContext):
 async def style_done_callback(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
-    user = get_user(callback.from_user.id)
-    style_count = len(get_style_samples(callback.from_user.id))
-    await callback.message.answer(
-        f"✅ Готово! Сохранено примеров стиля: {style_count}.\nБуду учитывать подачу в следующих генерациях 😉",
-        reply_markup=settings_keyboard(user),
-    )
+    user_id = callback.from_user.id
+    samples = get_style_samples(user_id)
+
+    if not samples:
+        await callback.message.answer(
+            "Нет сохранённых примеров стиля.",
+            reply_markup=settings_keyboard(get_user(user_id)),
+        )
+        return
+
+    wait_msg = await callback.message.answer("⏳ Анализирую твой стиль...")
+    try:
+        profile = await analyze_style_and_save(user_id, samples)
+        await wait_msg.delete()
+        await callback.message.answer(
+            f"✅ Профиль стиля сохранён!\n\n{profile}\n\nБуду учитывать это в следующих генерациях 😉",
+            reply_markup=settings_keyboard(get_user(user_id)),
+        )
+    except Exception as e:
+        logger.exception("Style analysis failed: %s", e)
+        await wait_msg.delete()
+        await callback.message.answer(
+            "Не удалось проанализировать стиль 😅 Попробуй позже.",
+            reply_markup=settings_keyboard(get_user(user_id)),
+        )
 
 # =========================
 # GENERATION INPUTS
@@ -1473,14 +1778,14 @@ async def buy_creator_callback(callback: CallbackQuery):
             raise RuntimeError("confirmation_url not found")
         await callback.answer()
         await callback.message.answer(
-            f"💳 Платёж для тарифа Creator готов.\n\nПерейдите по ссылке для оплаты:\n{confirmation_url}\n\n"
-            "После успешной оплаты тариф активируется автоматически ✨",
+            f"💳 Платёж для тарифа Creator готов.\n\nПерейдите по ссылке:\n{confirmation_url}\n\n"
+            "После оплаты тариф активируется автоматически ✨",
             reply_markup=main_menu_keyboard(),
         )
     except Exception as e:
         logger.exception("Failed to create Creator payment: %s", e)
         await callback.answer("Не удалось создать платёж", show_alert=True)
-        await callback.message.answer("Не получилось создать платёж 😅 Попробуем ещё раз чуть позже?", reply_markup=main_menu_keyboard())
+        await callback.message.answer("Не получилось создать платёж 😅 Попробуем чуть позже?", reply_markup=main_menu_keyboard())
 
 @dp.callback_query(F.data == "buy_unlim")
 async def buy_unlim_callback(callback: CallbackQuery):
@@ -1496,14 +1801,14 @@ async def buy_unlim_callback(callback: CallbackQuery):
             raise RuntimeError("confirmation_url not found")
         await callback.answer()
         await callback.message.answer(
-            f"💳 Платёж для тарифа Unlim готов.\n\nПерейдите по ссылке для оплаты:\n{confirmation_url}\n\n"
-            "После успешной оплаты тариф активируется автоматически ✨",
+            f"💳 Платёж для тарифа Unlim готов.\n\nПерейдите по ссылке:\n{confirmation_url}\n\n"
+            "После оплаты тариф активируется автоматически ✨",
             reply_markup=main_menu_keyboard(),
         )
     except Exception as e:
         logger.exception("Failed to create Unlim payment: %s", e)
         await callback.answer("Не удалось создать платёж", show_alert=True)
-        await callback.message.answer("Не получилось создать платёж 😅 Попробуем ещё раз чуть позже?", reply_markup=main_menu_keyboard())
+        await callback.message.answer("Не получилось создать платёж 😅 Попробуем чуть позже?", reply_markup=main_menu_keyboard())
 
 @dp.callback_query(F.data == "buy_gens_50")
 async def buy_gens_50_callback(callback: CallbackQuery):
@@ -1516,14 +1821,14 @@ async def buy_gens_50_callback(callback: CallbackQuery):
             raise RuntimeError("confirmation_url not found")
         await callback.answer()
         await callback.message.answer(
-            f"💳 Платёж на +50 генераций готов.\n\nПерейдите по ссылке для оплаты:\n{confirmation_url}\n\n"
+            f"💳 Платёж на +50 генераций готов.\n\nПерейдите по ссылке:\n{confirmation_url}\n\n"
             "После оплаты генерации зачислятся автоматически ✨",
             reply_markup=main_menu_keyboard(),
         )
     except Exception as e:
         logger.exception("Failed to create gens_50 payment: %s", e)
         await callback.answer("Не удалось создать платёж", show_alert=True)
-        await callback.message.answer("Не получилось создать платёж 😅 Попробуем ещё раз чуть позже?", reply_markup=main_menu_keyboard())
+        await callback.message.answer("Не получилось создать платёж 😅 Попробуем чуть позже?", reply_markup=main_menu_keyboard())
 
 @dp.callback_query(F.data == "buy_gens_100")
 async def buy_gens_100_callback(callback: CallbackQuery):
@@ -1536,14 +1841,14 @@ async def buy_gens_100_callback(callback: CallbackQuery):
             raise RuntimeError("confirmation_url not found")
         await callback.answer()
         await callback.message.answer(
-            f"💳 Платёж на +100 генераций готов.\n\nПерейдите по ссылке для оплаты:\n{confirmation_url}\n\n"
+            f"💳 Платёж на +100 генераций готов.\n\nПерейдите по ссылке:\n{confirmation_url}\n\n"
             "После оплаты генерации зачислятся автоматически ✨",
             reply_markup=main_menu_keyboard(),
         )
     except Exception as e:
         logger.exception("Failed to create gens_100 payment: %s", e)
         await callback.answer("Не удалось создать платёж", show_alert=True)
-        await callback.message.answer("Не получилось создать платёж 😅 Попробуем ещё раз чуть позже?", reply_markup=main_menu_keyboard())
+        await callback.message.answer("Не получилось создать платёж 😅 Попробуем чуть позже?", reply_markup=main_menu_keyboard())
 
 # =========================
 # FALLBACK
@@ -1577,21 +1882,17 @@ def get_tariff_price_and_amount(tariff: str) -> tuple[int, str]:
     return prices[tariff]
 
 def get_tariff_description(tariff: str) -> str:
-    descriptions = {
+    return {
         TARIFF_CREATOR: "Оплата тарифа Creator",
         TARIFF_UNLIM: "Оплата тарифа Unlim",
         "gens_50": "Покупка 50 генераций",
         "gens_100": "Покупка 100 генераций",
-    }
-    return descriptions.get(tariff, "Оплата тарифа")
+    }.get(tariff, "Оплата тарифа")
 
 async def create_yookassa_payment(user_id: int, tariff: str) -> dict:
     if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
         raise RuntimeError("YOOKASSA credentials are not set")
-
     amount_int, amount_str = get_tariff_price_and_amount(tariff)
-    idempotence_key = str(uuid.uuid4())
-
     payload = {
         "amount": {"value": amount_str, "currency": "RUB"},
         "capture": True,
@@ -1599,27 +1900,21 @@ async def create_yookassa_payment(user_id: int, tariff: str) -> dict:
         "description": get_tariff_description(tariff),
         "metadata": {"telegram_id": str(user_id), "tariff": tariff},
     }
-
     auth = aiohttp.BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
-    headers = {"Idempotence-Key": idempotence_key, "Content-Type": "application/json"}
-
+    headers = {"Idempotence-Key": str(uuid.uuid4()), "Content-Type": "application/json"}
     logger.info("Creating YooKassa payment | user_id=%s | tariff=%s", user_id, tariff)
-
     async with aiohttp.ClientSession(auth=auth) as session:
         async with session.post(YOOKASSA_API_URL, json=payload, headers=headers, timeout=30) as resp:
             text = await resp.text()
             if resp.status not in (200, 201):
-                logger.error("YooKassa create payment failed | status=%s | body=%s", resp.status, text)
+                logger.error("YooKassa failed | status=%s | body=%s", resp.status, text)
                 raise RuntimeError(f"YooKassa error: {resp.status} {text}")
             data = json.loads(text)
-
     payment_id = data.get("id")
     if not payment_id:
-        raise RuntimeError("YooKassa payment_id missing in response")
-
+        raise RuntimeError("YooKassa payment_id missing")
     create_payment_record(user_id=user_id, amount=amount_int, tariff=tariff, status="pending", payment_id=payment_id)
     track_event(user_id, "payment_created", value=tariff, meta={"payment_id": payment_id, "amount": amount_int})
-    logger.info("YooKassa payment created | payment_id=%s | user_id=%s", payment_id, user_id)
     return data
 
 def activate_tariff_for_user(user_id: int, tariff: str):
@@ -1640,14 +1935,14 @@ def activate_tariff_for_user(user_id: int, tariff: str):
 async def notify_user_payment_success(user_id: int, tariff: str):
     try:
         if tariff == "gens_50":
-            text = "✅ Оплата прошла успешно!\n\n+50 генераций зачислено на ваш счёт 🚀"
+            text = "✅ Оплата прошла!\n\n+50 генераций зачислено 🚀"
         elif tariff == "gens_100":
-            text = "✅ Оплата прошла успешно!\n\n+100 генераций зачислено на ваш счёт 🚀"
+            text = "✅ Оплата прошла!\n\n+100 генераций зачислено 🚀"
         else:
-            text = f"✅ Оплата прошла успешно!\n\nТариф {get_tariff_title(tariff)} активирован.\nМожно продолжать работу без пауз 🚀"
+            text = f"✅ Оплата прошла!\n\nТариф {get_tariff_title(tariff)} активирован.\nМожно работать без пауз 🚀"
         await bot.send_message(chat_id=user_id, text=text, reply_markup=main_menu_keyboard())
     except Exception as e:
-        logger.exception("Failed to notify user about payment success: %s", e)
+        logger.exception("Failed to notify user: %s", e)
 
 # =========================
 # WEBHOOK / HTTP SERVER
@@ -1659,8 +1954,7 @@ async def health_handler(request: web.Request) -> web.Response:
 async def yookassa_webhook_handler(request: web.Request) -> web.Response:
     try:
         payload = await request.json()
-        logger.info("YooKassa webhook received: %s", payload)
-
+        logger.info("YooKassa webhook: %s", payload)
         event_type = payload.get("event")
         obj = payload.get("object", {}) or {}
         payment_id = obj.get("id")
@@ -1668,27 +1962,21 @@ async def yookassa_webhook_handler(request: web.Request) -> web.Response:
         metadata = obj.get("metadata", {}) or {}
         tariff = metadata.get("tariff")
         telegram_id_raw = metadata.get("telegram_id")
-
         if not payment_id:
             return web.json_response({"ok": False, "error": "payment_id_missing"}, status=400)
-
         update_payment_status(payment_id, payment_status or "unknown")
-
         if event_type == "payment.succeeded" and payment_status == "succeeded":
-            payment_record = get_payment_by_payment_id(payment_id)
-            if payment_record:
-                tariff = tariff or payment_record.get("tariff")
-                telegram_id_raw = telegram_id_raw or payment_record.get("telegram_id")
-
+            record = get_payment_by_payment_id(payment_id)
+            if record:
+                tariff = tariff or record.get("tariff")
+                telegram_id_raw = telegram_id_raw or record.get("telegram_id")
             if not tariff or not telegram_id_raw:
-                logger.error("Webhook missing tariff or telegram_id | payment_id=%s", payment_id)
+                logger.error("Webhook missing tariff/telegram_id | payment_id=%s", payment_id)
                 return web.json_response({"ok": False, "error": "missing_metadata"}, status=400)
-
             user_id = int(telegram_id_raw)
             activate_tariff_for_user(user_id, tariff)
             track_event(user_id, "payment_success", value=tariff, meta={"payment_id": payment_id})
             await notify_user_payment_success(user_id, tariff)
-
         return web.json_response({"ok": True})
     except Exception as e:
         logger.exception("Webhook handler failed: %s", e)
@@ -1711,7 +1999,6 @@ async def start_http_server() -> web.AppRunner:
 async def main():
     logger.info("Bot starting...")
     init_db()
-    logger.info("DB initialized")
     await start_http_server()
     logger.info("Bot polling started")
     try:
