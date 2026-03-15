@@ -38,6 +38,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
 PAYMENT_RETURN_URL = os.getenv("PAYMENT_RETURN_URL", "")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 PORT = int(os.getenv("PORT", "8080"))
 
 if not TELEGRAM_BOT_TOKEN:
@@ -98,6 +99,7 @@ class GenerationStates(StatesGroup):
     waiting_for_rewrite_prompt = State()
     waiting_for_audience_input = State()
     waiting_for_custom_refinement = State()
+    waiting_for_web_search_confirm = State()
 
 class SettingsStates(StatesGroup):
     waiting_for_style_sample = State()
@@ -1001,6 +1003,69 @@ def get_limit_exceeded_text() -> str:
     return "Похоже, лимит генераций закончился 😅\n\nМожно выбрать тариф и продолжить без пауз 👇"
 
 # =========================
+# TAVILY WEB SEARCH
+# =========================
+
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+
+async def tavily_search(query: str, max_results: int = 5) -> Optional[str]:
+    """Search the web via Tavily and return a formatted context string."""
+    if not TAVILY_API_KEY:
+        logger.warning("TAVILY_API_KEY is not set — skipping web search")
+        return None
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "basic",
+        "max_results": max_results,
+        "include_answer": True,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(TAVILY_SEARCH_URL, json=payload, timeout=15) as resp:
+                if resp.status != 200:
+                    logger.error("Tavily error | status=%s", resp.status)
+                    return None
+                data = await resp.json()
+
+        parts = []
+
+        # Top-level answer if available
+        answer = data.get("answer")
+        if answer:
+            parts.append(f"Summary: {answer}")
+
+        # Individual results
+        for r in data.get("results", [])[:max_results]:
+            title = r.get("title", "")
+            content = r.get("content", "")
+            url = r.get("url", "")
+            if content:
+                snippet = content[:300].strip()
+                parts.append(f"- {title}: {snippet} ({url})")
+
+        if not parts:
+            return None
+
+        return "\n".join(parts)
+
+    except Exception as e:
+        logger.exception("Tavily search failed: %s", e)
+        return None
+
+
+def web_search_confirm_keyboard(category: str, prompt_key: str) -> InlineKeyboardMarkup:
+    """Inline keyboard asking whether to use web search."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="да", callback_data=f"ws_yes:{category}:{prompt_key}"),
+                InlineKeyboardButton(text="нет", callback_data=f"ws_no:{category}:{prompt_key}"),
+            ]
+        ]
+    )
+
+# =========================
 # COMMON SENDERS
 # =========================
 
@@ -1042,8 +1107,21 @@ async def analyze_style_and_save(user_id: int, samples: list[str]):
     return profile
 
 
-async def run_generation(user_id: int, category: str, user_prompt: str) -> str:
+async def run_generation(user_id: int, category: str, user_prompt: str,
+                         web_context: Optional[str] = None) -> str:
     system_messages = build_system_messages(user_id)
+
+    # Inject web search context as an extra system message if available
+    if web_context:
+        system_messages.append({
+            "role": "system",
+            "content": (
+                "Web search results for additional context "
+                "(use as factual background only, do not copy verbatim, do not mention sources explicitly):\n"
+                + web_context
+            )
+        })
+
     user = get_user(user_id)
     memory_enabled = bool(user.get("memory_enabled", True))
     memory_text = get_category_memory(user_id, category) if memory_enabled else None
@@ -1123,7 +1201,8 @@ async def run_refinement(session_id: int, refinement_type: str, extra: str = "")
 # GENERATION FLOW
 # =========================
 
-async def start_generation_flow(message: Message, category: str, user_prompt: str):
+async def start_generation_flow(message: Message, category: str, user_prompt: str,
+                                web_context: Optional[str] = None):
     user_id = message.from_user.id
     refresh_expired_plan_if_needed(user_id)
     user = get_user(user_id)
@@ -1140,7 +1219,7 @@ async def start_generation_flow(message: Message, category: str, user_prompt: st
     wait_msg = await message.answer("⏳ Готовлю результат... Обычно это занимает пару секунд.")
 
     try:
-        result_text = await run_generation(user_id, category, user_prompt)
+        result_text = await run_generation(user_id, category, user_prompt, web_context=web_context)
         save_history(user_id, category, "assistant", result_text, is_final=True)
         session_id = create_generation_session(user_id, category, user_prompt, result_text)
         track_event(user_id, "generation_success", category=category, meta={"response_length": len(result_text)})
@@ -1643,7 +1722,12 @@ async def handle_post_prompt(message: Message, state: FSMContext):
         await message.answer("Пришлите тему или вводные текстом ✍️")
         return
     await state.clear()
-    await start_generation_flow(message, CATEGORY_POST, user_prompt)
+    await state.update_data(pending_category=CATEGORY_POST, pending_prompt=user_prompt)
+    await state.set_state(GenerationStates.waiting_for_web_search_confirm)
+    await message.answer(
+        "Учитывать ли информацию из интернета?",
+        reply_markup=web_search_confirm_keyboard(CATEGORY_POST, "pending"),
+    )
 
 @dp.message(GenerationStates.waiting_for_ideas_prompt)
 async def handle_ideas_prompt(message: Message, state: FSMContext):
@@ -1652,7 +1736,12 @@ async def handle_ideas_prompt(message: Message, state: FSMContext):
         await message.answer("Пришлите тему, нишу или продукт текстом 💡")
         return
     await state.clear()
-    await start_generation_flow(message, CATEGORY_IDEAS, user_prompt)
+    await state.update_data(pending_category=CATEGORY_IDEAS, pending_prompt=user_prompt)
+    await state.set_state(GenerationStates.waiting_for_web_search_confirm)
+    await message.answer(
+        "Учитывать ли информацию из интернета?",
+        reply_markup=web_search_confirm_keyboard(CATEGORY_IDEAS, "pending"),
+    )
 
 @dp.message(GenerationStates.waiting_for_rewrite_prompt)
 async def handle_rewrite_prompt(message: Message, state: FSMContext):
@@ -1662,6 +1751,47 @@ async def handle_rewrite_prompt(message: Message, state: FSMContext):
         return
     await state.clear()
     await start_generation_flow(message, CATEGORY_REWRITE, user_prompt)
+
+# =========================
+# WEB SEARCH CONFIRM CALLBACKS
+# =========================
+
+@dp.callback_query(F.data.startswith("ws_yes:"))
+async def ws_yes_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    category = data.get("pending_category")
+    user_prompt = data.get("pending_prompt")
+    await state.clear()
+
+    if not category or not user_prompt:
+        await callback.message.answer("Что-то пошло не так. Попробуй ещё раз.", reply_markup=main_menu_keyboard())
+        return
+
+    search_msg = await callback.message.answer("🔍 Ищу актуальную информацию...")
+    web_context = await tavily_search(user_prompt)
+    await search_msg.delete()
+
+    if not web_context:
+        await callback.message.answer("Не удалось найти информацию. Генерирую без неё.")
+
+    await start_generation_flow(callback.message, category, user_prompt, web_context=web_context)
+
+
+@dp.callback_query(F.data.startswith("ws_no:"))
+async def ws_no_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    category = data.get("pending_category")
+    user_prompt = data.get("pending_prompt")
+    await state.clear()
+
+    if not category or not user_prompt:
+        await callback.message.answer("Что-то пошло не так. Попробуй ещё раз.", reply_markup=main_menu_keyboard())
+        return
+
+    await start_generation_flow(callback.message, category, user_prompt)
+
 
 # =========================
 # TWO-STEP REFINEMENT INPUTS
